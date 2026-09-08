@@ -1,0 +1,403 @@
+/* A single palette and composition language, from the greeting to configuration.
+   Root selectors also cover menus and dialogs portalled outside the app shell. */
+:root[data-appearance="light"], [data-theme="light"] {
+  color-scheme: light;
+  --color-background-surface-under: #f2eee7;
+  --color-background-surface: #fbf9f4;
+  --color-background-sidebar: #eeecf1;
+  --color-background-elevated: #fffdf8;
+  --color-background-control: #f2edf2;
+  --color-background-control-hover: #e7e2ef;
+  --color-background-control-active: #e0dbe9;
+  --color-background-button-secondary: #eeeaf1;
+  --color-background-button-secondary-hover: #e0d9eb;
+  --color-background-status-success: #e5efe7;
+  --color-background-status-warning: #f4ecdc;
+  --color-background-status-error: #f9e8e7;
+  --color-text-primary: #352f41;
+  --color-text-secondary: #5d5564;
+  --color-text-tertiary: #786d7a;
+  --color-text-disabled: #9991a1;
+  --color-text-accent: #745681;
+  --color-text-success: #286141;
+  --color-text-warning: #7b571d;
+  --color-text-error: #b33443;
+  --color-icon-primary: #3f3b54;
+  --color-icon-secondary: #61576e;
+  --color-icon-tertiary: #777083;
+  --color-border: #dcd7e1;
+  --color-border-light: #e9e4ec;
+  --color-border-heavy: #b4a8c2;
+  --color-border-focus: #78618f;
+  --moon-button: #393347;
+  --moon-button-text: #fffaf3;
+  --moon-gold: #ad8746;
+  --moon-scrollbar: #b8afc5;
+  --moon-switch-track: #b0a8bc;
+  --moon-pane: rgb(250 249 245 / 94%);
+  --moon-scene-opacity: .23;
+}
+
+:root[data-appearance="dark"], [data-theme="dark"] {
+  color-scheme: dark;
+  --color-background-surface-under: #12152e;
+  --color-background-surface: #20243d;
+  --color-background-sidebar: #191c33;
+  --color-background-elevated: #2d2b46;
+  --color-background-control: #302e4a;
+  --color-background-control-hover: #3c3557;
+  --color-background-control-active: #45395e;
+  --color-background-button-secondary: #37304e;
+  --color-background-button-secondary-hover: #493e65;
+  --color-background-status-success: #233b39;
+  --color-background-status-warning: #433a36;
+  --color-background-status-error: #452c43;
+  --color-text-primary: #f0ecfa;
+  --color-text-secondary: #c8c1db;
+  --color-text-tertiary: #b0a6c7;
+  --color-text-disabled: #827797;
+  --color-text-accent: #c8b0ef;
+  --color-text-success: #98d5b0;
+  --color-text-warning: #e8c78e;
+  --color-text-error: #f2a0ad;
+  --color-icon-primary: #eee4ff;
+  --color-icon-secondary: #c9bbdf;
+  --color-icon-tertiary: #a89ec3;
+  --color-border: #46405c;
+  --color-border-light: #36334c;
+  --color-border-heavy: #79658e;
+  --color-border-focus: #c1a5e9;
+  --moon-button: #d4c4ee;
+  --moon-button-text: #24203a;
+  --moon-gold: #ceb886;
+  --moon-scrollbar: #6c5c87;
+  --moon-switch-track: #5a4f71;
+  --moon-pane: rgb(32 36 61 / 94%);
+  --moon-scene-opacity: .36;
+}
+
+:root {
+  --moon-serif: "Noto Serif CJK SC", "Noto Serif CJK JP", "Songti SC", "Yu Mincho", Georgia, serif;
+}
+
+.app-root { background: var(--color-background-surface); }
+.app-sidebar { background: var(--color-background-sidebar); border-right: 1px solid var(--color-border-light); }
+.workspace, .browser-toolbar, .browser-tab-strip, .browser-empty, .launch-loading, .fatal-message {
+  background: var(--color-background-surface);
+}
+.manual-turn-guide { background: var(--color-background-elevated); }
+.sidebar-brand-identity > .antarctic-star { width: 23px; height: 23px; color: var(--color-text-accent); }
+.sidebar-footer { display: grid; gap: 9px; padding-top: 12px; }
+.sidebar-footer > .moon-theme-switch { justify-self: start; margin-left: 8px; }
+.button-primary { background: var(--moon-button); color: var(--moon-button-text); }
+.switch { background: var(--moon-switch-track); }
+.switch.is-on { background: var(--color-text-accent); }
+* { scrollbar-color: var(--moon-scrollbar) transparent; }
+*::-webkit-scrollbar-thumb { background-color: var(--moon-scrollbar); }
+.content-scroll:hover { scrollbar-color: var(--moon-scrollbar) transparent; }
+.content-scroll:hover::-webkit-scrollbar-thumb,
+.content-scroll:hover::-webkit-scrollbar-thumb:hover { background-color: var(--moon-scrollbar); }
+button:focus-visible, input:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--color-border-focus);
+  outline-offset: 3px;
+  box-shadow: none;
+}
+
+/* A small open scene, not a pill, track, bordered control, or expanding wave. */
+.moon-theme-switch {
+  position: relative;
+  display: inline-grid;
+  width: 76px;
+  height: 62px;
+  min-width: 44px;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.moon-weather-glyph { width: 100%; height: 100%; overflow: visible; transition: transform .3s ease; }
+.moon-theme-switch:hover:not(:disabled) .moon-weather-glyph { transform: translateY(-1px); }
+.moon-theme-switch:active:not(:disabled) .moon-weather-glyph { transform: translateY(0); }
+.moon-theme-switch:disabled { opacity: .78; }
+.moon-theme-description { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.welcome-top-actions { display: flex; flex: none; min-width: 0; align-items: center; gap: 14px; }
+.welcome-top-actions, .welcome-top-actions button { -webkit-app-region: no-drag; }
+.welcome-header-language { flex: none; min-width: 0; }
+.welcome-top-actions .language-menu-trigger {
+  min-width: 108px;
+  min-height: 36px;
+  height: auto;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.welcome-top-actions .language-menu-trigger > span { min-width: 0; }
+.welcome-top-actions .language-menu-trigger > svg { flex: none; }
+.welcome-top-actions .language-menu-panel {
+  width: min(176px, calc(100vw - 44px));
+  max-height: min(280px, calc(100dvh - 150px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.welcome-top-actions .language-menu-panel button { min-height: 36px; height: auto; padding-block: 8px; }
+.welcome-language-error {
+  position: relative;
+  z-index: 2;
+  flex: none;
+  max-width: min(580px, calc(100% - 44px));
+  margin: 0 clamp(22px, 5.3vw, 86px) 8px;
+  color: var(--color-text-error);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.welcome-brand, .welcome-brand small, .welcome-kicker, .welcome-stage h1,
+.welcome-stage > p, .welcome-friend, .welcome-about,
+.welcome-art-caption > span, .welcome-art-caption > small { transition: color .55s ease .12s; }
+.setting-row.has-poetic-title { padding-block: 16px; }
+.setting-row.has-poetic-title > div > strong { font-family: var(--moon-serif); font-size: 19px; font-weight: 400; }
+.feature-subtitle { display: block; margin-top: 7px; color: var(--color-text-accent); font-size: 10px; line-height: 1.7; }
+.setting-row p.feature-tagline, .feature-tagline { margin: 6px 0 0; font-family: var(--moon-serif); font-size: 12px; line-height: 1.8; color: var(--color-text-secondary); }
+.bigger-context-recommendation-header h2 { font-family: var(--moon-serif); font-size: 28px; font-weight: 400; }
+
+/* Dark Moon keeps the same geometry; only its materials and light change. */
+[data-theme="dark"] .welcome {
+  --welcome-paper: #20243d;
+  --welcome-ink: #f0ecfa;
+  --welcome-muted: #b0a6c7;
+  --welcome-line: #46405c;
+  --color-text-secondary: #c8c1db;
+  --color-icon-tertiary: #a89ec3;
+  --color-border-heavy: #79658e;
+  --color-background-control: #302e4a;
+  --color-background-control-hover: #3c3557;
+  --color-text-success: #98d5b0;
+  --color-border-focus: #c1a5e9;
+  color-scheme: dark;
+}
+[data-theme="dark"] .welcome-friend { color: #bfb0dc; }
+[data-theme="dark"] .welcome-stage > p,
+[data-theme="dark"] .welcome-art-caption > span { color: #c8c1db; }
+[data-theme="dark"] .welcome-stage > .welcome-invitation,
+[data-theme="dark"] .welcome-about,
+[data-theme="dark"] .welcome-kicker,
+[data-theme="dark"] .welcome-art-caption > small,
+[data-theme="dark"] .welcome-footer .text-button,
+[data-theme="dark"] .welcome-progress small { color: #b0a6c7; }
+[data-theme="dark"] .welcome-about summary:hover { color: #f0ecfa; }
+[data-theme="dark"] .welcome-option { color: #c4b7d7; }
+[data-theme="dark"] .welcome-option:hover,
+[data-theme="dark"] .welcome-option.is-active,
+[data-theme="dark"] .welcome-interaction-mode-picker > button.is-selected { background: #352f50; border-color: #79658e; }
+[data-theme="dark"] .welcome-option > span:first-child,
+[data-theme="dark"] .welcome-option.is-active > span:first-child,
+[data-theme="dark"] .welcome-interaction-mode-picker .interaction-mode-check { color: #c1a5e9; }
+.welcome button:focus-visible, .welcome summary:focus-visible { outline-color: var(--color-border-focus); }
+.welcome-footer > .button-primary { background: var(--moon-button); border-color: var(--moon-button); color: var(--moon-button-text); }
+.welcome-footer > .button-primary:hover:not(:disabled) { background: var(--moon-button); opacity: .9; }
+.interaction-mode-picker > button strong { font-family: var(--moon-serif); font-size: 18px; font-weight: 400; line-height: 1.5; }
+.welcome-interaction-mode-picker > button strong { font-size: 20px; }
+.interaction-mode-picker small.interaction-mode-subtitle { margin: 3px 0 12px; font-size: 10px; letter-spacing: .12em; color: var(--color-text-accent); }
+.interaction-mode-picker > button { border-radius: 3px; }
+
+/* Configuration is another chapter, never a visually unrelated utility panel. */
+.content-surface { position: relative; isolation: isolate; }
+.journey-scenery { position: absolute; z-index: -1; inset: 0; pointer-events: none; opacity: var(--moon-scene-opacity); }
+.journey-scenery .welcome-art { inset: 0; opacity: 1; }
+.journey-scenery .welcome-art-canvas { width: 100%; height: 100%; }
+.journey-scenery::after { position: absolute; inset: 0; background: linear-gradient(90deg, var(--color-background-surface) 15%, transparent 100%); content: ""; }
+.journey-scenery .welcome-art::after { display: none; }
+.content-scroll, .content-scroll.is-narrow {
+  position: relative;
+  width: min(800px, calc(100% - 88px));
+  padding: 26px 8px 48px;
+}
+.content-scroll.is-fit { padding-bottom: 16px; }
+.surface-header, .content-scroll.is-fit .surface-header { display: block; margin-bottom: 28px; }
+.surface-header .journey-signature,
+.content-scroll.is-fit .surface-header .journey-signature {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0 0 18px;
+  color: var(--color-text-accent);
+}
+.journey-signature .antarctic-star { width: 18px; height: 18px; }
+.journey-signature i { width: 68px; height: 1px; background: var(--moon-gold); opacity: .75; }
+.surface-header h1, .content-scroll.is-fit .surface-header h1 {
+  font-family: var(--moon-serif);
+  font-size: clamp(26px, 3vw, 40px);
+  font-weight: 400;
+  line-height: 1.4;
+}
+.surface-header p, .content-scroll.is-fit .surface-header p {
+  display: block;
+  max-width: 630px;
+  margin: 10px 0 0;
+  line-height: 1.75;
+  overflow: visible;
+}
+.setup-row, .setting-row { min-height: 88px; }
+.setup-row p, .setting-row p, .next-surface-row small { line-height: 1.7; }
+.setup-row .button-secondary, .next-surface-row .button-secondary,
+.wizard-footer .button-primary, .wizard-content .button-secondary { min-height: 38px; padding-inline: 18px; border-radius: 24px; }
+.setup-index { border-color: var(--moon-gold); font-family: var(--font-mono); }
+.wizard-stepper { padding-block: 6px 18px; margin-bottom: 18px; border-bottom: 1px solid var(--color-border); }
+.wizard-stepper button { border-radius: 0; }
+.wizard-stepper button > span { border-color: var(--color-border-heavy); color: var(--color-text-tertiary); font-family: var(--font-mono); }
+.wizard-stepper button.is-active { background: transparent; }
+.wizard-stepper button.is-active > span { background: var(--moon-button); border-color: var(--moon-button); color: var(--moon-button-text); }
+.wizard-stepper button.is-complete > span { color: var(--color-text-success); }
+.mcp-stage { overflow: auto; flex: 1 1 0; padding: 2px 4px; }
+.wizard-content { flex: 0 0 auto; overflow: visible; }
+.wizard-content > header > span { padding-top: 6px; color: var(--moon-gold); }
+.wizard-content h2 { font-family: var(--moon-serif); font-size: 24px; font-weight: 400; line-height: 1.5; }
+.wizard-content header p { line-height: 1.8; }
+.journey-tutorial { flex: none; padding: 8px 12px; border: 1px solid var(--color-border); border-radius: 3px; background: var(--moon-pane); color: var(--color-text-secondary); }
+.journey-tutorial summary { display: list-item; padding: 4px; cursor: pointer; font-size: 12px; line-height: 1.6; }
+.journey-tutorial summary > svg { display: inline-block; width: 14px; height: 14px; margin: 0 7px -2px 2px; }
+.journey-tutorial[open] .guide-media { margin-top: 12px; aspect-ratio: 16 / 9; max-height: 300px; }
+.field-row { padding: 10px 0; }
+.field-row input { min-height: 38px; border-radius: 3px; }
+.wizard-footer { flex: none; margin-top: 16px; padding: 18px 0 6px; border-top: 1px solid var(--color-border); background: var(--moon-pane); }
+.wizard-footer .button-primary { min-width: 110px; }
+.browser-empty { isolation: isolate; }
+.browser-empty > :not(.browser-constellation) { position: relative; z-index: 1; }
+.browser-constellation { position:absolute; inset:0; z-index:0; overflow:hidden; pointer-events:none; color:var(--moon-gold); }
+.browser-constellation-glow { position:absolute; left:50%; top:50%; width:260px; height:260px; transform:translate(-50%,-50%); border-radius:50%; background:radial-gradient(circle, rgb(186 165 238 / 22%), transparent 68%); filter:blur(2px); opacity:.18; transition:opacity .8s ease, transform 1.1s cubic-bezier(.22,1,.36,1); }
+.browser-constellation.is-browser::before,.browser-constellation.is-browser::after { content:""; position:absolute; left:48%; top:31%; width:49%; height:38%; border:1px solid var(--moon-gold); border-left-color:transparent; border-bottom-color:transparent; border-radius:50%; opacity:.18; transform:rotate(-18deg); }
+.browser-constellation.is-browser::after { left:53%; top:36%; width:39%; height:30%; opacity:.12; transform:rotate(16deg); }
+.browser-constellation.is-browser .browser-constellation-glow { left:76%; top:38%; width:170px; height:170px; background:radial-gradient(circle, rgb(198 183 244 / 13%), transparent 69%); filter:none; }
+.browser-constellation.is-browser .browser-constellation-star { width:2px; height:2px; box-shadow:0 0 6px currentColor; opacity:.2; }
+.browser-constellation.is-browser.is-surge .browser-constellation-star { animation-duration:1.2s; }
+.browser-constellation.is-browser.is-steady .browser-constellation-star { opacity:.36; }
+.browser-constellation.is-browser.is-dim .browser-constellation-star { opacity:.12; }
+.browser-constellation-moon { position:absolute; left:50%; top:50%; width:84px; height:84px; transform:translate(-50%,-50%); border-radius:50%; background:linear-gradient(135deg,#fffced 0%,#d7d0f1 58%,#9487c2 100%); opacity:.26; box-shadow:0 0 46px rgb(198 183 244 / 24%); transition:opacity .8s ease, box-shadow .8s ease; }
+.browser-constellation-moon::after { content:""; position:absolute; width:76px; height:76px; top:-8px; left:20px; border-radius:50%; background:#181829; }
+.browser-constellation-star { position:absolute; left:var(--star-x); top:var(--star-y); width:3px; height:3px; border-radius:50%; background:currentColor; opacity:.22; transform:translate(-50%,-50%); box-shadow:0 0 8px currentColor; }
+.browser-constellation.is-surge .browser-constellation-glow { opacity:.72; transform:translate(-50%,-50%) scale(1.2); }
+.browser-constellation.is-surge .browser-constellation-moon { opacity:.9; box-shadow:0 0 70px rgb(198 183 244 / 42%); }
+.browser-constellation.is-surge .browser-constellation-star { animation:browserConstellationSurge 1.05s cubic-bezier(.22,1,.36,1) both; animation-delay:var(--star-delay); }
+.browser-constellation.is-steady .browser-constellation-glow { opacity:.42; }
+.browser-constellation.is-steady .browser-constellation-moon { opacity:.7; box-shadow:0 0 48px rgb(198 183 244 / 28%); }
+.browser-constellation.is-steady .browser-constellation-star { opacity:.5; }
+.browser-constellation.is-dim .browser-constellation-glow { opacity:.12; transform:translate(-50%,-50%) scale(.88); }
+.browser-constellation.is-dim .browser-constellation-moon { opacity:.24; box-shadow:0 0 24px rgb(198 183 244 / 12%); }
+.browser-constellation.is-dim .browser-constellation-star { opacity:.2; animation:browserConstellationDim 1.2s ease both; animation-delay:var(--star-delay); }
+@keyframes browserConstellationSurge {
+  0% { opacity:.04; transform:translate(-50%,-50%) scale(.35); }
+  46% { opacity:.92; transform:translate(calc(var(--star-tx) * .36),calc(var(--star-ty) * .36)) scale(1.8); }
+  100% { opacity:.7; transform:translate(var(--star-tx),var(--star-ty)) scale(1); }
+}
+@keyframes browserConstellationDim {
+  0% { opacity:.55; transform:translate(-50%,-50%) scale(1.25); }
+  100% { opacity:.12; transform:translate(calc(var(--star-tx) * .55),calc(var(--star-ty) * .55)) scale(.65); }
+}
+.browser-constellation.is-reduced-motion .browser-constellation-star { animation:none; opacity:.45; transform:translate(var(--star-tx),var(--star-ty)) scale(1); }
+.browser-constellation.is-reduced-motion .browser-constellation-glow { transition:none; opacity:.35; }
+.browser-constellation.is-reduced-motion .browser-constellation-moon { transition:none; opacity:.65; }
+.browser-empty > .antarctic-star { width: 36px; height: 36px; margin-bottom: 25px; color: var(--color-text-accent); }
+.browser-empty h1 { font-family: var(--moon-serif); font-size: 36px; font-weight: 400; }
+.browser-empty p { line-height: 1.8; }
+.browser-empty .button-primary { min-height: 40px; padding: 0 24px; border-radius: 28px; }
+
+@media (max-width: 960px) {
+  .content-scroll, .content-scroll.is-narrow { width: calc(100% - 48px); }
+  .welcome-top-actions { gap: 10px; }
+  .welcome-top-actions .welcome-version { display: none; }
+}
+@media (max-width: 760px) {
+  .welcome-top { gap: 12px; min-height: 112px; flex-basis: 112px; align-items: flex-start; }
+  .welcome-top-actions { align-self: center; }
+  .welcome-brand { max-width: 48%; }
+  .welcome-top .moon-theme-switch { width: 68px; height: 56px; }
+  .content-scroll, .content-scroll.is-narrow { width: calc(100% - 32px); padding-top: 18px; }
+  .surface-header, .content-scroll.is-fit .surface-header { margin-bottom: 18px; }
+  .surface-header h1, .content-scroll.is-fit .surface-header h1 { font-size: 27px; }
+  .wizard-content h2 { font-size: 22px; }
+  .setting-row { gap: 14px; }
+  .interaction-mode-picker { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 520px) {
+  /* Give language and the moon their own row instead of shrinking either. */
+  .welcome-top { flex-wrap: wrap; align-content: center; min-height: 124px; flex-basis: 124px; row-gap: 2px; padding-block: 12px 8px; }
+  .welcome-top .welcome-brand { max-width: none; flex: 1 1 100%; }
+  .welcome-top-actions { margin-left: auto; }
+}
+@media (max-width: 420px) {
+  .welcome-top { padding-right: 22px; gap: 10px; }
+  .welcome-top .moon-theme-switch { width: 64px; height: 52px; }
+  .welcome-brand { flex: 1; }
+  .welcome-interaction-mode-picker > button { padding: 16px; }
+  .welcome-interaction-mode-picker > button strong { font-size: 19px; }
+  .setting-row:has(.moon-theme-switch) { grid-template-columns: 1fr; padding-block: 14px; }
+  .setting-row .moon-theme-switch { justify-self: start; }
+}
+@media (max-height: 640px) {
+  .surface-header .journey-signature, .content-scroll.is-fit .surface-header .journey-signature { display: none; }
+  .content-scroll.is-fit .surface-header { margin-bottom: 12px; }
+  .wizard-stepper { padding-block: 0 8px; margin-bottom: 8px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-root *, .app-root *::before, .app-root *::after { animation: none !important; transition: none !important; }
+}
+
+/* First-run is one continuous full-screen story. The workbench is mounted only
+   after the native completion check, not shown as a setup task list. */
+.journey-chapter > p { max-width: 520px; }
+.journey-chapter > p.journey-preview-notice { margin: 0 0 16px; color: var(--color-text-accent); font-size: 11px; line-height: 1.7; }
+.journey-links { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+.journey-links .button-secondary { min-height: 38px; padding-inline: 15px; border: 1px solid var(--color-border-heavy); border-radius: 3px; background: var(--color-background-control); }
+.journey-fields { display: grid; gap: 22px; margin-top: 30px; }
+.journey-fields label { display: grid; gap: 10px; font-size: 12px; color: var(--color-text-secondary); }
+.journey-fields input { width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid var(--color-border-heavy); border-radius: 3px; background: var(--color-background-control); color: var(--color-text-primary); font-family: var(--font-mono); }
+.journey-fields input::placeholder { color: var(--color-text-disabled); }
+.journey-saved, .journey-connector-name { margin-top: 28px; padding: 18px 0; border-block: 1px solid var(--color-border); }
+.journey-saved p { color: var(--color-text-secondary); font-size: 13px; line-height: 1.7; }
+.journey-connector-name small { display: block; margin-bottom: 10px; color: var(--color-text-tertiary); }
+.journey-connector-name code { display: block; color: var(--color-text-primary); overflow-wrap: anywhere; }
+.journey-live-status { display: flex; gap: 12px; align-items: center; margin-top: 30px; color: var(--color-text-accent); font-size: 12px; }
+.journey-live-status .antarctic-star { width: 17px; height: 17px; }
+.journey-failure { margin-top: 22px; padding: 12px 16px; border-left: 2px solid var(--color-text-error); background: var(--color-background-status-error); font-size: 12px; line-height: 1.7; }
+.journey-failure p { margin: 0 0 10px; }
+.journey-failure pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.journey-recovery { margin-top: 18px; font-size: 12px; line-height: 1.65; }
+.journey-recovery summary { cursor: pointer; }
+.journey-login-controls { display: flex; align-items: center; gap: 8px; }
+.setup-paused { display: grid; place-items: center; padding: 50px 8%; background: var(--color-background); }
+.setup-paused > section { width: min(720px, 100%); }
+.setup-paused h1 { font-size: clamp(28px, 4vw, 48px); }
+.setup-paused p, .journey-external-login p { font-size: 13px; line-height: 1.8; color: var(--color-text-secondary); }
+.journey-recovery > p { margin-block: 10px; overflow-wrap: anywhere; color: var(--color-text-secondary); }
+.journey-recovery-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.journey-recovery-actions .button-secondary { min-height: 36px; padding: 7px 12px; border: 1px solid var(--color-border-heavy); border-radius: 4px; }
+.catalog-readiness { margin-top: 20px; padding: 16px; border: 1px solid var(--color-border-heavy); border-radius: 8px; background: var(--color-background-control); }
+.catalog-readiness h2 { margin: 0; font-size: 16px; }
+.catalog-readiness p { font-size: 13px; line-height: 1.75; }
+.catalog-readiness dl { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 5px; font-size: 12px; }
+.catalog-readiness dd { margin: 0; overflow-wrap: anywhere; }
+.catalog-readiness ul { padding-left: 18px; font-size: 12px; }
+.catalog-readiness small { display: block; font-size: 11px; line-height: 1.6; color: var(--color-text-secondary); }
+.catalog-readiness .button-secondary { margin-top: 12px; padding: 8px 12px; min-height: 40px; }
+.catalog-readiness .button-primary { margin-top: 12px; padding: 10px 14px; min-height: 42px; width: 100%; }
+.journey-chapter .welcome-about ul { margin-block: 12px; padding-left: 18px; }
+.journey-chapter .welcome-about li { margin-block: 7px; }
+.journey-progress-line { width: 64px; height: 2px; background: var(--color-border); overflow: hidden; }
+.journey-progress-line i { display: block; width: 100%; height: 100%; background: var(--moon-gold); transform-origin: left; transition: transform 1s ease; }
+.first-run-journey .welcome-footer { grid-template-columns: auto minmax(50px, 1fr) auto; }
+.first-run-journey .welcome-footer > .button-primary { max-width: 250px; padding-block: 12px; line-height: 1.5; }
+.journey-browser-panel { position: fixed; z-index: 10; inset: 100px 3% 26px; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--color-border-heavy); border-radius: 10px; background: var(--color-background-elevated); box-shadow: 0 14px 90px rgb(0 0 0 / 28%); }
+.journey-browser-panel > header { display: flex; flex: none; gap: 14px; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--color-border); font-weight: 400; font-size: 13px; }
+.journey-browser-slot { flex: 1; min-height: 0; }
+@media (max-width: 420px) {
+  .first-run-journey .welcome-footer { column-gap: 10px; }
+  .first-run-journey .welcome-footer > .button-primary { max-width: 180px; font-size: 11px; }
+  .journey-progress-line { width: 40px; }
+}

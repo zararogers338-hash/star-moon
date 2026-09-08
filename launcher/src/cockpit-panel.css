@@ -1,0 +1,21 @@
+.cockpit-panel { margin-top:24px; padding:20px; border:1px solid var(--color-border); border-radius:16px; background:linear-gradient(135deg, color-mix(in srgb, var(--moon-pane) 92%, transparent), transparent); }
+.cockpit-panel header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+.cockpit-panel-kicker { color:var(--moon-gold); font:9px var(--font-mono); letter-spacing:.16em; }
+.cockpit-panel h2 { margin:7px 0 4px; font:400 22px/1.4 var(--moon-serif); }
+.cockpit-panel header p { max-width:600px; margin:0; color:var(--color-text-secondary); font-size:11px; line-height:1.7; }
+.cockpit-panel-state { flex:none; padding:7px 10px; border:1px solid var(--color-border); border-radius:999px; color:var(--color-text-tertiary); font:10px var(--font-mono); }
+.cockpit-panel-state.is-ready { border-color:var(--color-border-heavy); color:var(--color-text-success); }
+.cockpit-panel-fields { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:18px; }
+.cockpit-panel-fields label { display:flex; flex-direction:column; gap:6px; color:var(--color-text-tertiary); font-size:10px; }
+.cockpit-panel-fields input { min-width:0; min-height:38px; padding:8px 10px; border:1px solid var(--color-border); border-radius:8px; background:var(--color-background-elevated); color:var(--color-text-primary); font:11px var(--font-mono); }
+.cockpit-panel-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:16px; }
+.cockpit-panel-actions .button-primary,.cockpit-panel-actions .button-secondary { min-height:36px; padding-inline:15px; border-radius:22px; }
+.cockpit-route-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-top:14px; }
+.cockpit-route-card { display:grid; grid-template-columns:auto 1fr; gap:3px 8px; padding:10px 12px; border:1px solid var(--color-border); border-radius:10px; background:color-mix(in srgb,var(--color-background-elevated) 72%,transparent); }
+.cockpit-route-card strong { font:12px var(--font-mono); color:var(--color-text-primary); }
+.cockpit-route-card span:last-child { grid-column:1 / -1; color:var(--color-text-tertiary); font-size:10px; }
+.cockpit-route-provider { color:var(--moon-gold); font:9px var(--font-mono); letter-spacing:.12em; }
+.cockpit-panel-evidence { margin-top:14px; color:var(--color-text-tertiary); font-size:10px; line-height:1.6; }
+.cockpit-panel-evidence.is-ready { color:var(--color-text-success); }
+.cockpit-panel-evidence.is-failed { color:var(--color-text-warning); }
+@media(max-width:760px) { .cockpit-panel-fields { grid-template-columns:1fr; } .cockpit-panel header { flex-direction:column; } }

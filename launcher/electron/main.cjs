@@ -1,0 +1,1558 @@
+const fs = require("node:fs");
+const net = require("node:net");
+const path = require("node:path");
+const { spawnSync } = require("node:child_process");
+const { pathToFileURL } = require("node:url");
+const {
+  app,
+  BrowserWindow,
+  WebContentsView,
+  clipboard,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeImage,
+  nativeTheme,
+  screen,
+  shell,
+  Tray,
+} = require("electron");
+const { BrowserHost, navigationErrorForLog } = require("./browser-host.cjs");
+const { pauseGuidedSetup } = require("./guided-setup-control.cjs");
+const { BrowserControlServer } = require("./control-server.cjs");
+const { getAutostart, setAutostart } = require("./autostart.cjs");
+const { SUPPORT_REPOSITORY_URL, FORK_UPDATES_READY } = require("./project-links.cjs");
+const { companionExtensionInfo } = require("./companion-extension.cjs");
+const { finishGuidedSetup } = require("./finish-guided-setup.cjs");
+const { AgentDockBridge } = require("./agentdock-bridge.cjs");
+const { CodexCopies } = require("./codex-copies.cjs");
+const { CodexCopyLogin } = require("./codex-copy-login.cjs");
+const { createMoonLetter } = require("./moon-letter.cjs");
+const {
+  createLogger,
+  exportSanitizedLogs,
+  installProcessDiagnosticGuards,
+  registerLoggedIpc,
+} = require("./logging.cjs");
+const { RuntimeHost } = require("./runtime.cjs");
+const { ensurePackagedRuntime, waitForPackagedRuntimeSource } = require("./runtime-install.cjs");
+const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
+const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
+const { runtimeBundlePaths } = require("./runtime-command.cjs");
+const { createUpdateController } = require("./update.cjs");
+const {
+  createStateStore,
+  nextSessionRefreshReminderAt,
+  validateSidebarState,
+  validateTheme,
+} = require("./state.cjs");
+const {
+  MIN_WINDOW_BOUNDS,
+  readWindowState,
+  trackWindowState,
+} = require("./window-state.cjs");
+
+const isDev = !app.isPackaged && Boolean(process.env.VITE_DEV_SERVER_URL);
+const SOURCE_ROOT = path.resolve(__dirname, "../..");
+const LAUNCHER_PROFILE = resolveLauncherProfile({ appData: app.getPath("appData") });
+const IS_DEV_PROFILE = LAUNCHER_PROFILE.kind === DEVELOPMENT_PROFILE;
+const CORE_HOME = LAUNCHER_PROFILE.coreHome;
+const BROWSER_DESCRIPTOR_PATH = path.join(CORE_HOME, "runtime", "launcher-browser.json");
+const BROWSER_HELPER_PATH = app.isPackaged
+  ? path.join(process.resourcesPath, "runtime", "app", "browser-helper.cjs")
+  : path.join(SOURCE_ROOT, ".launcher-runtime", "browser-helper.cjs");
+const GITHUB_URL = SUPPORT_REPOSITORY_URL;
+const COMPANION_EXTENSION = companionExtensionInfo();
+const CONNECTORS_URL = "https://chatgpt.com/#settings/Plugins";
+const TUNNELS_URL = "https://platform.openai.com/settings/organization/tunnels";
+const KEYS_URL = "https://platform.openai.com/settings/organization/api-keys";
+const ALLOWED_EXTERNAL_URLS = new Set([
+  GITHUB_URL,
+  CONNECTORS_URL,
+  TUNNELS_URL,
+  KEYS_URL,
+  COMPANION_EXTENSION.repository,
+  COMPANION_EXTENSION.downloadUrl,
+].filter(Boolean));
+const PACKAGED_RENDERER_URL = pathToFileURL(path.join(__dirname, "..", "dist", "index.html")).href;
+const APP_ICON_PATH = path.join(__dirname, "..", "assets", "icon.png");
+
+process.env.CODEX_CHATGPT_WEB_HOME = CORE_HOME;
+process.env.CODEX_HOME = LAUNCHER_PROFILE.codexHome;
+app.setName(LAUNCHER_PROFILE.displayName);
+// Linux Electron builds can lose the NVIDIA GPU process while the embedded
+// ChatGPT surface is navigating Cloudflare/auth pages.  That destroys the
+// renderer WebContents and leaves login verification waiting forever.  Keep
+// the launcher on Chromium's software compositor on Linux so the login
+// surface remains recoverable across the whole handoff.
+if (process.platform === "linux") app.disableHardwareAcceleration();
+if (process.platform === "win32") {
+  app.setAppUserModelId(LAUNCHER_PROFILE.appId);
+}
+const launcherUserData = LAUNCHER_PROFILE.userData;
+fs.mkdirSync(launcherUserData, { recursive: true, mode: 0o700 });
+if (process.platform !== "win32") fs.chmodSync(launcherUserData, 0o700);
+app.setPath("userData", launcherUserData);
+app.setAppLogsPath(path.join(launcherUserData, "logs"));
+installProcessDiagnosticGuards({
+  filePath: path.join(launcherUserData, "logs", "process-stream-errors.log"),
+});
+
+let mainWindow = null;
+let mainWindowReadyToShow = false;
+let mainWindowShowRequested = false;
+let browserHost = null;
+let runtimeHost = null;
+let copies = null;
+let copyLogin = null;
+let pendingCopyLogin = process.argv.find(value => /^--codex-copy-login=[a-f0-9-]{36}$/.test(value))?.split("=")[1] || null;
+let pendingCopyVerify = process.argv.find(value => /^--codex-copy-verify=[a-f0-9-]{36}$/.test(value))?.split("=")[1] || null;
+let browserControl = null;
+let runtimeSupervisor = null;
+let tray = null;
+let quitting = false;
+let shutdownInProgress = false;
+let exitCommitted = false;
+let smokePassedThisSession = false;
+let cdpPort = 0;
+let lastOperation = null;
+let catalogVerificationTimer = null;
+let catalogVerificationInFlight = false;
+let catalogVerificationGeneration = 0;
+let updateController = null;
+let agentDockBridge = null;
+let moonLetterSession = null;
+let moonLetterCreating = false;
+
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = address && typeof address === "object" ? address.port : 0;
+      server.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+function send(channel, value) {
+  if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+    mainWindow.webContents.send(channel, value);
+  }
+}
+
+function publishOperation(operation) {
+  lastOperation = operation;
+  send("launcher:operation", operation);
+}
+
+function stopCatalogVerificationMonitor() {
+  catalogVerificationGeneration++;
+  if (catalogVerificationTimer) clearInterval(catalogVerificationTimer);
+  catalogVerificationTimer = null;
+}
+
+function startCatalogVerificationMonitor({ logger, stateStore }) {
+  stopCatalogVerificationMonitor();
+  const generation = catalogVerificationGeneration;
+  const check = async () => {
+    const current = stateStore.read();
+    if (current.coreSetupComplete !== true || current.codexCatalogVerified === true) {
+      stopCatalogVerificationMonitor();
+      return;
+    }
+    if (catalogVerificationInFlight || !runtimeSupervisor) return;
+    catalogVerificationInFlight = true;
+    try {
+      const config = runtimeSupervisor.readConfig();
+      const health = await runtimeSupervisor.proxyHealthPayload(config);
+      if (!Number.isInteger(health?.successful_model_catalog_requests)
+        || health.successful_model_catalog_requests < 1) return;
+      if (runtimeHost.currentOperation()) return;
+      const evidence = await runtimeHost.catalogStatus();
+      if (generation !== catalogVerificationGeneration || evidence.state !== "observed"
+        || stateStore.read().coreSetupComplete !== true) return;
+      const state = stateStore.update({
+        codexCatalogVerified: true,
+        codexRestartRequired: false,
+        catalogCheckDeferred: false,
+      });
+      logger.info("codex.model_catalog_verified", {
+        requests: health.successful_model_catalog_requests,
+        at: health.last_successful_model_catalog_request_at,
+      });
+      send("launcher:state-changed", state);
+      stopCatalogVerificationMonitor();
+    } catch (error) {
+      logger.debug("codex.model_catalog_verification_pending", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      catalogVerificationInFlight = false;
+    }
+  };
+  catalogVerificationTimer = setInterval(() => { void check(); }, 2_000);
+  catalogVerificationTimer.unref?.();
+  void check();
+}
+
+async function restoreCodexRouteAfterRuntimeFailure({ logger, stateStore }) {
+  try {
+    const route = await runtimeHost.restoreBridgeRoute("runtime-start-fail-safe");
+    if (!route.installed || route.active) return { restored: false };
+    const state = stateStore.update({
+      codexCatalogVerified: false,
+      codexRestartRequired: true,
+    });
+    send("launcher:state-changed", state);
+    stopCatalogVerificationMonitor();
+    logger.warn("bridge.route_restored_after_runtime_failure", {
+      changed: route.changed === true,
+    });
+    return { restored: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.error("bridge.route_restore_after_runtime_failure_failed", { message });
+    return { restored: false, error: message };
+  }
+}
+
+function trayImage() {
+  if (process.platform !== "darwin") {
+    return nativeImage.createFromPath(APP_ICON_PATH).resize({ width: 18, height: 18 });
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18"><path d="M4.1 3.4h6.4l3.4 3.4v7.8H7.5l-3.4-3.4V3.4Z" fill="none" stroke="white" stroke-width="1.5" stroke-linejoin="round"/><path d="m7 7 2-2 2 2M7 11l2 2 2-2" fill="none" stroke="white" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  const image = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`);
+  image.setTemplateImage(true);
+  return image;
+}
+
+const NATIVE_COPY = Object.freeze({
+  en: Object.freeze({
+    openLauncher: "Open Project Star & Moon",
+    quit: "Quit",
+    exportDiagnostics: "Export privacy-safe diagnostics",
+    cancel: "Cancel uninstall",
+    remove: "Confirm uninstall",
+    removeTitle: "Remove Codex integration",
+    removeMessage: "May starlight go with you. Until we meet again.",
+  }),
+  "zh-CN": Object.freeze({
+    openLauncher: "打开星月计划",
+    quit: "退出",
+    exportDiagnostics: "导出隐私安全诊断",
+    cancel: "取消卸载",
+    remove: "确认卸载",
+    removeTitle: "移除 Codex 集成",
+    removeMessage: "愿星光与你同行，我们下次再会",
+  }),
+  "zh-Hant": Object.freeze({
+    openLauncher: "開啟星月計畫", quit: "結束", exportDiagnostics: "匯出已保護隱私的診斷資訊",
+    cancel: "取消解除安裝", remove: "確認解除安裝", removeTitle: "移除 Codex 整合",
+    removeMessage: "願星光與你同行，我們下次再會",
+  }),
+  ja: Object.freeze({
+    openLauncher: "星と月プロジェクトを開く",
+    quit: "終了",
+    exportDiagnostics: "プライバシー保護済みの診断情報をエクスポート",
+    cancel: "アンインストールをキャンセル",
+    remove: "アンインストールを確認",
+    removeTitle: "Codex 統合を削除",
+    removeMessage: "星の光があなたとともにありますように。またお会いしましょう。",
+  }),
+  fr: Object.freeze({
+    openLauncher: "Ouvrir le projet Étoile et Lune", quit: "Quitter", exportDiagnostics: "Exporter des diagnostics anonymisés",
+    cancel: "Annuler la désinstallation", remove: "Confirmer la désinstallation", removeTitle: "Retirer l’intégration Codex",
+    removeMessage: "Que la lumière des étoiles vous accompagne. À notre prochaine rencontre.",
+  }),
+  ru: Object.freeze({
+    openLauncher: "Открыть проект «Звезда и Луна»", quit: "Выйти", exportDiagnostics: "Экспорт очищенной диагностики",
+    cancel: "Отменить удаление", remove: "Подтвердить удаление", removeTitle: "Удаление интеграции Codex",
+    removeMessage: "Пусть свет звёзд будет с вами. До новой встречи.",
+  }),
+  de: Object.freeze({
+    openLauncher: "Projekt Stern und Mond öffnen", quit: "Beenden", exportDiagnostics: "Bereinigte Diagnose exportieren",
+    cancel: "Deinstallation abbrechen", remove: "Deinstallation bestätigen", removeTitle: "Codex-Integration entfernen",
+    removeMessage: "Möge dich das Sternenlicht begleiten. Bis zu unserem nächsten Wiedersehen.",
+  }),
+});
+
+function nativeCopyFor(language) {
+  return NATIVE_COPY[language] || NATIVE_COPY.en;
+}
+
+function updateTrayMenu(language) {
+  if (!tray) return;
+  const copy = nativeCopyFor(language);
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: copy.openLauncher, click: () => showMainWindow() },
+    { type: "separator" },
+    { label: copy.quit, click: () => { void requestQuit(); } },
+  ]));
+}
+
+function createTray(logger, language) {
+  try {
+    tray = new Tray(trayImage());
+    tray.setToolTip(LAUNCHER_PROFILE.displayName);
+    updateTrayMenu(language);
+    tray.on("click", () => showMainWindow());
+    return true;
+  } catch (error) {
+    tray = null;
+    logger.warn("launcher.tray_unavailable", { message: error instanceof Error ? error.message : String(error) });
+    return false;
+  }
+}
+
+function showMainWindow() {
+  // A Windows login launch may still be materializing the packaged runtime when the user opens
+  // the desktop shortcut. Electron delivers `second-instance` immediately, before `createWindow`
+  // has produced anything to show. Preserve that foreground request until the real window reaches
+  // `ready-to-show`; otherwise the already-running `--hidden` instance silently consumes it.
+  mainWindowShowRequested = true;
+  if (!mainWindowReadyToShow || !mainWindow || mainWindow.isDestroyed()) return;
+  mainWindowShowRequested = false;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+async function openWebUrl(url) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error(`Refusing to open a non-web URL: ${parsed.protocol}`);
+  }
+  await shell.openExternal(parsed.toString());
+}
+
+function rendererNavigationAllowed(value) {
+  let target;
+  try {
+    target = new URL(value);
+  } catch {
+    return false;
+  }
+  if (isDev) {
+    try {
+      return target.origin === new URL(process.env.VITE_DEV_SERVER_URL).origin;
+    } catch {
+      return false;
+    }
+  }
+  target.hash = "";
+  target.search = "";
+  return target.href === PACKAGED_RENDERER_URL;
+}
+
+function windowStateSnapshot(window) {
+  return {
+    fullScreen: Boolean(window && !window.isDestroyed() && window.isFullScreen()),
+    maximized: Boolean(window && !window.isDestroyed() && window.isMaximized()),
+  };
+}
+
+function createWindow({ logger, stateStore, windowStatePath, startHidden }) {
+  const isMac = process.platform === "darwin";
+  const state = stateStore.read();
+  const windowState = readWindowState(windowStatePath, screen.getAllDisplays());
+  const window = new BrowserWindow({
+    width: windowState.bounds.width,
+    height: windowState.bounds.height,
+    ...(Number.isFinite(windowState.bounds.x) && Number.isFinite(windowState.bounds.y)
+      ? { x: windowState.bounds.x, y: windowState.bounds.y }
+      : {}),
+    minWidth: MIN_WINDOW_BOUNDS.width,
+    minHeight: MIN_WINDOW_BOUNDS.height,
+    title: LAUNCHER_PROFILE.displayName,
+    icon: APP_ICON_PATH,
+    show: false,
+    backgroundColor: isMac ? "#00000000" : "#181818",
+    titleBarStyle: isMac ? "hiddenInset" : "hidden",
+    transparent: isMac,
+    ...(isMac ? {
+      trafficLightPosition: { x: 16, y: 17 },
+      vibrancy: "under-window",
+      visualEffectState: "active",
+    } : {
+      titleBarOverlay: {
+        color: "#181818",
+        symbolColor: "#a8a8a8",
+        height: 46,
+      },
+    }),
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      spellcheck: true,
+      v8CacheOptions: "bypassHeatCheckAndEagerCompile",
+    },
+  });
+  window.setMenuBarVisibility(false);
+  const guardRendererNavigation = (event, url) => {
+    if (rendererNavigationAllowed(url)) return;
+    event.preventDefault();
+    let destination = "invalid URL";
+    try { destination = new URL(url).origin; } catch {}
+    logger.warn("launcher.renderer_navigation_blocked", { destination });
+  };
+  window.webContents.on("will-navigate", guardRendererNavigation);
+  window.webContents.on("will-redirect", guardRendererNavigation);
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    void openWebUrl(url).catch((error) => {
+      logger.warn("launcher.external_url_rejected", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return { action: "deny" };
+  });
+  window.on("close", (event) => {
+    if (quitting) return;
+    event.preventDefault();
+    if (stateStore.read().keepRunningOnClose && tray) window.hide();
+    else void requestQuit();
+  });
+  window.on("closed", () => {
+    if (mainWindow === window) {
+      mainWindow = null;
+      mainWindowReadyToShow = false;
+    }
+  });
+  for (const event of ["enter-full-screen", "leave-full-screen", "maximize", "unmaximize"]) {
+    window.on(event, () => send("launcher:window-state-changed", windowStateSnapshot(window)));
+  }
+  window.once("ready-to-show", () => {
+    if (!state.onboardingComplete && !Number.isFinite(windowState.bounds.x)) window.center();
+    if (windowState.maximized) window.maximize();
+    if (windowState.fullscreen) window.setFullScreen(true);
+    if (mainWindow === window) mainWindowReadyToShow = true;
+    if (mainWindowShowRequested) showMainWindow();
+    else if (!startHidden) window.show();
+  });
+  trackWindowState(window, windowStatePath, (error) => {
+    logger.warn("launcher.window_state_write_failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  });
+  logger.info("launcher.window_created", { platform: process.platform, cdpPort });
+  return window;
+}
+
+async function loadRenderer(window) {
+  if (isDev) {
+    await window.loadURL(process.env.VITE_DEV_SERVER_URL);
+    return;
+  }
+  await window.loadFile(path.join(__dirname, "..", "dist", "index.html"));
+}
+
+function validateLanguage(value) {
+  if (value !== "en" && value !== "zh-CN" && value !== "zh-Hant" && value !== "ja" && value !== "fr" && value !== "ru" && value !== "de") {
+    throw new Error("Language must be en, zh-CN, zh-Hant, ja, fr, ru, or de");
+  }
+  return value;
+}
+
+function validateBrowserInteractionMode(value) {
+  if (value !== "automatic" && value !== "manual") {
+    throw new Error("Browser interaction mode must be automatic or manual");
+  }
+  return value;
+}
+
+function validateBounds(value) {
+  if (!value || typeof value !== "object") throw new Error("Browser bounds are required");
+  for (const key of ["x", "y", "width", "height"]) {
+    if (!Number.isFinite(value[key])) throw new Error(`Browser bounds ${key} must be finite`);
+  }
+  return value;
+}
+
+function smokePassedForCurrentVersion(state) {
+  return state.browserSmokePassed === true && state.browserSmokeVersion === app.getVersion();
+}
+
+function registerIpc({ logger, stateStore }) {
+  const handlers = new Map();
+  const handle = (channel, handler) => { handlers.set(channel, handler); registerLoggedIpc(ipcMain, logger, channel, handler); };
+  const trustedHandle = (channel, handler) => handle(channel, (event, ...args) => {
+    if (!mainWindow || event.sender !== mainWindow.webContents || event.senderFrame !== mainWindow.webContents.mainFrame) throw new Error("Untrusted launcher frame");
+    return handler(...args);
+  });
+  trustedHandle("launcher:codex-copies-list", () => copies.list());
+  trustedHandle("launcher:codex-copies-create", input => copies.create(input));
+  trustedHandle("launcher:codex-copies-inspect", id => copies.inspect(id));
+  trustedHandle("launcher:codex-copies-open", id => copies.open(id));
+  trustedHandle("launcher:codex-copies-archive", (id, archived) => copies.archive(id, archived));
+  trustedHandle("launcher:codex-copies-folder", id => { const { root } = copies.read(id); return shell.openPath(root); });
+  trustedHandle("launcher:codex-copy-login-start", id => copyLogin.begin(id));
+  trustedHandle("launcher:codex-copy-login-verify", id => copyLogin.begin(id, { verifySaved: true }));
+  trustedHandle("launcher:codex-copy-login-status", () => copyLogin.snapshot());
+  trustedHandle("launcher:codex-copy-login-cancel", () => copyLogin.cancel());
+  trustedHandle("launcher:codex-copy-login-bounds", bounds => { copyLogin.setBounds(bounds); return true; });
+  agentDockBridge = new AgentDockBridge({ directory: path.join(launcherUserData, "agentdock"), openExternal: openWebUrl,
+    notify: value => send("launcher:agentdock-changed", value) });
+  trustedHandle("launcher:agentdock-read", () => agentDockBridge.snapshot());
+  trustedHandle("launcher:agentdock-configure", input => agentDockBridge.configure(input));
+  trustedHandle("launcher:agentdock-inspect", () => agentDockBridge.inspect());
+  trustedHandle("launcher:agentdock-login", () => agentDockBridge.login());
+  trustedHandle("launcher:agentdock-web-setup", async () => {
+    const configured = agentDockBridge.snapshot();
+    const publicUrl = configured.publicUrl || (configured.url.startsWith("https:") ? configured.url : "");
+    if (!publicUrl) throw new Error("Configure your public HTTPS MCP address before opening web setup");
+    browserHost.setSurfaceActive(true);
+    await browserHost.waitForSurfaceReady();
+    return browserHost.openConnectorSettings();
+  });
+  const setupStatus = () => {
+    const state = stateStore.read();
+    return { signedIn: browserHost?.snapshot().authenticated === true, smokePassed: smokePassedThisSession || smokePassedForCurrentVersion(state),
+      coreInstalled: state.coreSetupComplete === true, catalogVerified: state.codexCatalogVerified === true,
+      callbackConfigured: runtimeHost?.mcpCredentialsConfigured() === true, callbackVerified: state.mcpSetupComplete === true,
+      agentDock: agentDockBridge.snapshot().state, complete: state.guidedSetupComplete === true && agentDockBridge.snapshot().state === "connected",
+      ...(moonLetterSession ? moonLetterSession.status() : {}) };
+  };
+  const invokeSetup = channel => handlers.get(channel)({ sender: mainWindow.webContents, senderFrame: mainWindow.webContents.mainFrame });
+  trustedHandle("launcher:moon-letter-create", async consent => {
+    if (consent !== true || !stateStore.read().onboardingComplete) throw new Error("Choose your setup mode and consent before creating a Moon Letter");
+    if (moonLetterCreating || moonLetterSession?.status().operationRunning) throw new Error("Wait for the current setup operation before creating another Moon Letter");
+    moonLetterCreating = true;
+    try {
+    await moonLetterSession?.close();
+    moonLetterSession = await createMoonLetter({ directory: path.join(launcherUserData, "moon-letters"), language: stateStore.read().language || "en", inspect: async () => setupStatus(),
+      perform: async action => {
+        if (action === "open-login") { await invokeSetup("launcher:browser-login"); return { state: "needs-user", action: "complete-sign-in" }; }
+        if (action === "authorize-agentdock") { await agentDockBridge.login(); return { state: "needs-user", action: "complete-agentdock-authorization" }; }
+        const state = stateStore.read();
+        if (state.browserInteractionMode === "automatic" && !setupStatus().signedIn) return { state: "needs-user", action: "sign-in" };
+        if (state.browserInteractionMode === "automatic" && !setupStatus().smokePassed) {
+          const result = await invokeSetup("launcher:browser-smoke");
+          if (!result.ok) throw new Error("Browser response test failed");
+          return setupStatus();
+        }
+        if (!state.coreSetupComplete) { await invokeSetup("launcher:setup-core"); return setupStatus(); }
+        if (!state.codexCatalogVerified || state.codexRestartRequired) return { state: "needs-user", action: "restart-codex" };
+        if (!runtimeHost.mcpCredentialsConfigured()) return { state: "needs-user", action: "configure-native2-credentials-in-launcher" };
+        if (!state.mcpSetupComplete) {
+          const report = await invokeSetup("launcher:mcp-verify");
+          if (!report.ok) throw new Error("Native2 verification failed");
+          return setupStatus();
+        }
+        if (!agentDockBridge.snapshot().url) return { state: "needs-user", action: "configure-agentdock-address-in-launcher" };
+        const agentDock = await agentDockBridge.inspect();
+        if (agentDock.state !== "connected") return { state: "needs-user", action: "authorize-or-repair-agentdock", connectionState: agentDock.state };
+        await invokeSetup("launcher:finish-guided-setup");
+        return setupStatus();
+      },
+    });
+    return moonLetterSession.info;
+    } finally { moonLetterCreating = false; }
+  });
+  trustedHandle("launcher:moon-letter-status", () => setupStatus());
+  trustedHandle("launcher:moon-letter-open", async () => { if (!moonLetterSession) throw new Error("Create a Moon Letter first"); await openWebUrl(moonLetterSession.info.controlUrl); return true; });
+  trustedHandle("launcher:moon-letter-stop", async () => { moonLetterSession?.revoke(); return true; });
+  handle("launcher:snapshot", async () => ({
+    profile: LAUNCHER_PROFILE.kind,
+    profilePaths: {
+      coreHome: CORE_HOME,
+      codexHome: LAUNCHER_PROFILE.codexHome,
+      userData: launcherUserData,
+    },
+    state: stateStore.read(),
+    browser: browserHost?.snapshot() ?? null,
+    connectorName: runtimeHost.browserConnectorName(),
+    connectorNames: {
+      automatic: runtimeHost.setupConnectorName(),
+      manual: "Codex Zero Risk",
+    },
+    mcpCredentialsConfigured: runtimeHost?.mcpCredentialsConfigured() ?? false,
+    logs: logger.recent(),
+    urls: {
+      github: GITHUB_URL,
+      connectors: CONNECTORS_URL,
+      tunnels: TUNNELS_URL,
+      keys: KEYS_URL,
+      companionExtension: COMPANION_EXTENSION.downloadUrl,
+      companionRepository: COMPANION_EXTENSION.repository,
+    },
+    platform: process.platform,
+    packaged: app.isPackaged,
+    version: app.getVersion(),
+    smokePassed: smokePassedThisSession || smokePassedForCurrentVersion(stateStore.read()),
+    operation: lastOperation,
+    update: updateController?.getState() ?? { status: "disabled" },
+  }));
+
+  handle("launcher:set-language", (_event, language) => {
+    const state = stateStore.update({ language: validateLanguage(language) });
+    updateTrayMenu(state.language);
+    return state;
+  });
+  handle("launcher:set-theme", (_event, theme) => stateStore.update({ theme: validateTheme(theme) }));
+  handle("launcher:complete-onboarding", (_event, language, rawInteractionMode) => {
+    const current = stateStore.read();
+    if (current.autoStart) setAutostart(app, true);
+    const next = stateStore.update({
+      language: validateLanguage(language),
+      browserInteractionMode: validateBrowserInteractionMode(rawInteractionMode),
+      onboardingComplete: true,
+      guidedSetupComplete: false,
+      catalogCheckDeferred: false,
+    });
+    updateTrayMenu(next.language);
+    logger.info("launcher.onboarding_completed", {
+      language: next.language,
+      browserInteractionMode: next.browserInteractionMode,
+    });
+    return next;
+  });
+  handle("launcher:open-external", async (_event, url) => {
+    if (!ALLOWED_EXTERNAL_URLS.has(url)) throw new Error("External URL is not allowlisted");
+    await openWebUrl(url);
+    return true;
+  });
+
+  handle("launcher:reopen-onboarding", () => {
+    const current = stateStore.read();
+    const next = stateStore.update({
+      onboardingComplete: false,
+      guidedSetupComplete: false,
+      guidedSetupPaused: false,
+      guidedSetupResumeStage: current.browserInteractionMode === "manual" ? "tunnel" : "account",
+    });
+    send("launcher:state-changed", next);
+    return next;
+  });
+
+  handle("launcher:browser-bounds", (event, bounds) => {
+    browserHost?.setBounds(validateBounds(bounds), event.sender.getZoomFactor());
+    return true;
+  });
+  handle("launcher:browser-surface-active", (_event, active) => browserHost.setSurfaceActive(active === true));
+  handle("launcher:browser-show", async () => {
+    const browser = await browserHost.reveal(stateStore.read().browserInteractionMode === "automatic");
+    const state = stateStore.update({ browserVisible: true });
+    send("launcher:state-changed", state);
+    return browser;
+  });
+  handle("launcher:browser-hide", () => {
+    browserHost?.hide();
+    const state = stateStore.update({ browserVisible: false });
+    send("launcher:state-changed", state);
+    return browserHost?.snapshot();
+  });
+  handle("launcher:browser-navigate", (_event, action) => browserHost.navigate(action));
+  handle("launcher:browser-zoom", (_event, action) => {
+    const browser = browserHost.zoom(action);
+    const state = stateStore.update({ browserZoomFactor: browser.zoomFactor });
+    send("launcher:state-changed", state);
+    return browser;
+  });
+  handle("launcher:browser-tab-select", (_event, tabId) => browserHost.selectTab(tabId));
+  handle("launcher:browser-tab-close", (_event, tabId) => browserHost.closeTab(tabId));
+  handle("launcher:manual-prompt-copy", (_event, tabId) => browserHost.copyManualPrompt(tabId));
+  handle("launcher:manual-prompt-sent", (_event, tabId) => browserHost.confirmManualSent(tabId));
+  handle("launcher:browser-login", async () => {
+    const browser = await browserHost.openLogin();
+    if (browser.authenticated) {
+      const state = stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
+      send("launcher:state-changed", state);
+    }
+    return browser;
+  });
+  handle("launcher:browser-login-cancel", () => browserHost.cancelLogin());
+  handle("launcher:browser-login-reload", async () => {
+    const browser = await browserHost.reloadLogin();
+    if (browser.authenticated) {
+      const state = stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
+      send("launcher:state-changed", state);
+    }
+    return browser;
+  });
+  handle("launcher:browser-passkey-login", async () => {
+    await browserHost.cancelLogin();
+    const browser = await browserHost.openPasskeyLogin();
+    if (browser.authenticated) {
+      const state = stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
+      send("launcher:state-changed", state);
+    }
+    return browser;
+  });
+  handle("launcher:browser-passkey-login-continue", () => runtimeHost.continuePasskeyLogin());
+  handle("launcher:browser-passkey-login-cancel", () => runtimeHost.cancelPasskeyLogin());
+  handle("launcher:guided-setup-pause", (_event, stage) => {
+    const state = pauseGuidedSetup(stateStore, stage, runtimeHost.currentOperation() || browserHost.currentOperation());
+    browserHost.setSurfaceActive(false);
+    send("launcher:state-changed", state);
+    return state;
+  });
+  handle("launcher:guided-setup-resume", () => {
+    const state = stateStore.update({ guidedSetupPaused: false });
+    send("launcher:state-changed", state);
+    return state;
+  });
+  handle("launcher:guided-setup-page", (_event, stage) => {
+    const { SETUP_STAGES } = require("./guided-setup-control.cjs");
+    if (!SETUP_STAGES.includes(stage)) throw new Error("Invalid configuration page");
+    const state = stateStore.update({ guidedSetupResumeStage: stage });
+    send("launcher:state-changed", state);
+    return true;
+  });
+  handle("launcher:quit", () => requestQuit());
+  handle("launcher:browser-logout", async () => {
+    const browser = await browserHost.logout();
+    const state = stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
+    send("launcher:state-changed", state);
+    return { browser, state };
+  });
+  handle("launcher:session-reminder-dismiss", () => {
+    const state = stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
+    send("launcher:state-changed", state);
+    return state;
+  });
+  handle("launcher:browser-smoke", async () => {
+    if (stateStore.read().browserInteractionMode === "manual") {
+      throw new Error("Browser smoke testing is disabled in Zero Risk mode");
+    }
+    const result = await browserHost.smokeTest();
+    stateStore.update({ browserSmokePassed: true, browserSmokeVersion: app.getVersion() });
+    smokePassedThisSession = true;
+    return result;
+  });
+  handle("launcher:mcp-verify", async (event) => {
+    const operationName = "mcp-verification";
+    const activeTraceId = browserHost.activeTraceId;
+    logger.info("mcp.verification_requested", {
+      activeTraceId,
+      launcherFocused: mainWindow?.isFocused() === true,
+      rendererFocused: event.sender.isFocused(),
+    });
+    if (activeTraceId) {
+      const report = {
+        ok: false,
+        checks: [{
+          id: "connector",
+          status: "error",
+          message: "Finish the active Codex task before verifying the ChatGPT connector",
+          detail: `Active browser turn: ${activeTraceId}`,
+        }],
+      };
+      const state = stateStore.update({ mcpSetupComplete: false });
+      send("launcher:state-changed", state);
+      publishOperation({ name: operationName, status: "failed", message: report.checks[0].message });
+      return report;
+    }
+    publishOperation({ name: operationName, status: "running", message: "Checking local runtime" });
+    const report = IS_DEV_PROFILE ? await runtimeHost.devDoctor() : await runtimeHost.doctor();
+    if (!report.ok) {
+      const message = report.checks
+        .filter((check) => check.status === "error")
+        .map((check) => check.message)
+        .filter(Boolean)
+        .join("; ") || "The local MCP runtime is not healthy";
+      const state = stateStore.update({ mcpSetupComplete: false });
+      send("launcher:state-changed", state);
+      publishOperation({ name: operationName, status: "failed", message });
+      return report;
+    }
+    if (stateStore.read().browserInteractionMode === "manual") {
+      const state = stateStore.update({ mcpSetupComplete: true });
+      send("launcher:state-changed", state);
+      const successMessage = "Local Zero Risk runtime is healthy; connector selection remains a manual turn step";
+      publishOperation({ name: operationName, status: "completed", message: successMessage });
+      return {
+        ...report,
+        checks: [
+          ...report.checks.filter((check) => check.id !== "connector"),
+          {
+            id: "connector",
+            status: "warning",
+            message: `Select ChatGPT connector ${JSON.stringify(runtimeHost.mcpConnectorName())} manually for every Zero Risk turn`,
+          },
+        ],
+      };
+    }
+    try {
+      publishOperation({ name: operationName, status: "running", message: "Checking ChatGPT connector" });
+      await browserHost.verifyConnector(runtimeHost.mcpConnectorName());
+      const state = stateStore.update({ mcpSetupComplete: true });
+      send("launcher:state-changed", state);
+      const successMessage = IS_DEV_PROFILE
+        ? "DEV harness and connector verified"
+        : "Runtime and connector verified";
+      publishOperation({ name: operationName, status: "completed", message: successMessage });
+      return {
+        ...report,
+        checks: report.checks.map((check) => check.id === "connector"
+          ? {
+              id: "connector",
+              status: "ok",
+              message: `ChatGPT connector ${JSON.stringify(runtimeHost.mcpConnectorName())} is available`,
+            }
+          : check),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const state = stateStore.update({ mcpSetupComplete: false });
+      send("launcher:state-changed", state);
+      publishOperation({ name: operationName, status: "failed", message });
+      return {
+        ...report,
+        ok: false,
+        checks: [
+          ...report.checks.filter((check) => check.id !== "connector"),
+          { id: "connector", status: "error", message },
+        ],
+      };
+    }
+  });
+
+  handle("launcher:doctor", () => IS_DEV_PROFILE ? runtimeHost.devDoctor() : runtimeHost.doctor());
+  trustedHandle("launcher:cockpit-status", () => runtimeHost.cockpitStatus());
+  trustedHandle("launcher:cockpit-configure", input => runtimeHost.cockpitConfigure(input));
+  trustedHandle("launcher:cockpit-probe", () => runtimeHost.cockpitProbe());
+  trustedHandle("launcher:cockpit-rollback", () => runtimeHost.cockpitRollback());
+  trustedHandle("launcher:cockpit-evidence", input => runtimeHost.cockpitEvidence(input));
+  trustedHandle("launcher:cockpit-key-file", async () => {
+    const result = await dialog.showOpenDialog(mainWindow, { title: "Select a private Cockpit API key file", properties: ["openFile"] });
+    return result.canceled ? null : result.filePaths[0] || null;
+  });
+  trustedHandle("launcher:cockpit-client-key-copy", async () => {
+    clipboard.writeText(await runtimeHost.cockpitClientKey());
+    return true;
+  });
+  trustedHandle("launcher:finish-guided-setup", () => finishGuidedSetup({
+    stateStore, browserHost, runtimeHost, isDevProfile: IS_DEV_PROFILE,
+    smokePassed: state => smokePassedThisSession || smokePassedForCurrentVersion(state),
+    verifyAgentDock: async () => (await agentDockBridge.inspect()).state === "connected",
+    notify: state => send("launcher:state-changed", state),
+  }));
+  handle("launcher:cancel-turns", () => {
+    if (IS_DEV_PROFILE) throw new Error("DEV chat turns are owned by the repository CLI process");
+    return runtimeHost.cancelActiveTurns();
+  });
+  handle("launcher:uninstall-integration", async () => {
+    if (IS_DEV_PROFILE) throw new Error("DEV profile has no Codex integration to remove");
+    const copy = nativeCopyFor(stateStore.read().language);
+    const confirmation = await dialog.showMessageBox(mainWindow, {
+      type: "none",
+      buttons: [copy.cancel, copy.remove],
+      defaultId: 0,
+      cancelId: 0,
+      title: copy.removeTitle,
+      message: copy.removeMessage,
+      noLink: true,
+    });
+    if (confirmation.response !== 1) return { cancelled: true };
+    try {
+      await runtimeHost.uninstallIntegration();
+    } finally {
+      browserHost.writeDescriptor();
+    }
+    const state = stateStore.update({
+      coreSetupComplete: false,
+      guidedSetupComplete: false,
+      codexCatalogVerified: false,
+      catalogCheckDeferred: false,
+      mcpSetupComplete: false,
+      mcpRuntimeInstalled: false,
+      mcpGuideStep: 0,
+      codexRestartRequired: true,
+      browserInteractionMode: "automatic",
+      experimentalBiggerContext: false,
+      zeroRiskProEnabled: false,
+    });
+    send("launcher:state-changed", state);
+    stopCatalogVerificationMonitor();
+    return { cancelled: false, state };
+  });
+  handle("launcher:setup-core", async () => {
+    const setupState = stateStore.read();
+    if (setupState.browserInteractionMode === "automatic") {
+      const browser = await browserHost.probeAuthentication();
+      if (!browser.authenticated) {
+        throw new Error(
+          IS_DEV_PROFILE
+            ? "Sign in to the isolated DEV ChatGPT profile before configuring the harness"
+            : "Sign in to ChatGPT before installing the Codex integration",
+        );
+      }
+    }
+    if (setupState.browserInteractionMode === "automatic"
+      && !setupState.coreSetupComplete
+      && !(smokePassedThisSession || smokePassedForCurrentVersion(setupState))) {
+      throw new Error(
+        IS_DEV_PROFILE
+          ? "Run the browser smoke test before configuring the DEV harness"
+          : "Run the browser smoke test before installing the Codex integration",
+      );
+    }
+    const result = IS_DEV_PROFILE ? await runtimeHost.setupDevCore() : await runtimeHost.setupCore();
+    stateStore.update({
+      coreSetupComplete: true,
+      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
+      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+      zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
+      ...(result.mode === "full" ? {
+        mcpRuntimeInstalled: true,
+        mcpSetupComplete: false,
+        mcpGuideStep: 2,
+      } : {
+        mcpSetupComplete: false,
+        mcpRuntimeInstalled: false,
+        mcpGuideStep: 0,
+      }),
+    });
+    await browserHost.returnToIdle().catch((error) => {
+      logger.warn("browser.idle_cleanup_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
+  });
+  handle("launcher:setup-mcp", async (_event, input) => {
+    const currentMode = stateStore.read().browserInteractionMode;
+    const interactionMode = input?.interactionMode === undefined
+      ? currentMode
+      : validateBrowserInteractionMode(input.interactionMode);
+    const interactionModeChange = interactionMode !== currentMode;
+    const setup = IS_DEV_PROFILE
+      ? runtimeHost.setupDevMcp.bind(runtimeHost)
+      : runtimeHost.setupMcp.bind(runtimeHost);
+    const runSetup = afterRuntimeReady => setup({
+      tunnelId: typeof input?.tunnelId === "string" ? input.tunnelId.trim() : "",
+      runtimeKey: typeof input?.runtimeKey === "string" ? input.runtimeKey : "",
+      replace: input?.replace === true,
+      interactionMode,
+    }, afterRuntimeReady);
+    if (!interactionModeChange && interactionMode === "automatic") await browserHost.reveal();
+    const result = interactionModeChange
+      ? await browserHost.withInteractionModeChange(interactionMode, runSetup)
+      : await runSetup();
+    const state = stateStore.update({
+      browserInteractionMode: interactionMode,
+      ...(interactionMode === "manual" ? { experimentalBiggerContext: false } : {}),
+      zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
+      coreSetupComplete: true,
+      codexCatalogVerified: IS_DEV_PROFILE,
+      mcpRuntimeInstalled: true,
+      mcpSetupComplete: false,
+      mcpGuideStep: 2,
+      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+    });
+    send("launcher:state-changed", state);
+    if (interactionModeChange) send("launcher:browser-state", browserHost.snapshot());
+    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    return { ok: true, stdout: result.stdout };
+  });
+  handle("launcher:set-mcp-step", (_event, step) => {
+    if (!Number.isInteger(step) || step < 0 || step > 2) throw new Error("Invalid MCP guide step");
+    return stateStore.update({ mcpGuideStep: step });
+  });
+
+  handle("launcher:autostart", (_event, enabled) => {
+    if (IS_DEV_PROFILE) throw new Error("The isolated DEV launcher is started explicitly from the repository CLI");
+    if (typeof enabled !== "boolean") throw new Error("Autostart preference must be boolean");
+    const desired = enabled === true;
+    const autostart = setAutostart(app, desired);
+    if (!autostart.supported) return { state: stateStore.read(), ...autostart };
+    if (autostart.enabled !== desired) throw new Error("Autostart was not confirmed by the operating system");
+    return {
+      state: stateStore.update({ autoStart: desired }),
+      ...autostart,
+    };
+  });
+  handle("launcher:bigger-context", async (_event, enabled) => {
+    const result = await runtimeHost.setBiggerContext(enabled === true);
+    const state = stateStore.update({
+      experimentalBiggerContext: result.enabled,
+      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
+      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+    });
+    send("launcher:state-changed", state);
+    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    return state;
+  });
+  handle("launcher:zero-risk-pro", async (_event, enabled) => {
+    const browserOperation = browserHost.currentOperation();
+    if (browserHost.activeTraceId || browserOperation) {
+      throw new Error(
+        browserHost.activeTraceId
+          ? "Finish or cancel active ChatGPT turns before changing Zero Risk model profiles"
+          : `Finish ${browserOperation} before changing Zero Risk model profiles`,
+      );
+    }
+    const result = await runtimeHost.setZeroRiskPro(enabled === true);
+    const state = stateStore.update({
+      zeroRiskProEnabled: result.enabled,
+      codexCatalogVerified: IS_DEV_PROFILE,
+      codexRestartRequired: !IS_DEV_PROFILE,
+    });
+    send("launcher:state-changed", state);
+    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    return state;
+  });
+  handle("launcher:browser-interaction-mode", async (_event, rawMode) => {
+    const mode = validateBrowserInteractionMode(rawMode);
+    const current = stateStore.read();
+    if (current.browserInteractionMode === mode) {
+      return { state: current, credentialsRequired: false, targetMode: mode };
+    }
+    const browserOperation = browserHost.currentOperation();
+    if (browserHost.activeTraceId || browserOperation) {
+      throw new Error(
+        browserHost.activeTraceId
+          ? "Finish or cancel active ChatGPT turns before changing browser interaction mode"
+          : `Finish ${browserOperation} before changing browser interaction mode`,
+      );
+    }
+    if (!runtimeHost.mcpCredentialsConfigured(mode)) {
+      return { state: current, credentialsRequired: true, targetMode: mode };
+    }
+    const result = await browserHost.withInteractionModeChange(
+      mode,
+      afterRuntimeReady => runtimeHost.setBrowserInteractionMode(mode, afterRuntimeReady),
+    );
+    const state = stateStore.update({
+      browserInteractionMode: mode,
+      ...(mode === "manual" ? { experimentalBiggerContext: false } : {}),
+      ...(result.configured ? {
+        codexCatalogVerified: IS_DEV_PROFILE,
+        codexRestartRequired: !IS_DEV_PROFILE,
+      } : {}),
+    });
+    send("launcher:state-changed", state);
+    send("launcher:browser-state", browserHost.snapshot());
+    if (!IS_DEV_PROFILE && result.configured) startCatalogVerificationMonitor({ logger, stateStore });
+    return { state, credentialsRequired: false, targetMode: mode };
+  });
+  handle("launcher:set-preference", (_event, key, value) => {
+    const ordinary = key === "keepRunningOnClose" || key === "showBrowserDuringTurns";
+    if (!ordinary) throw new Error("Unknown preference");
+    return stateStore.update({ [key]: value === true });
+  });
+  handle("launcher:sidebar-state", (_event, value) => stateStore.update(validateSidebarState(value)));
+  handle("launcher:logs", (_event, limit) => logger.recent(limit));
+  handle("launcher:catalog-status", async () => {
+    const evidence = await runtimeHost.catalogStatus();
+    if (evidence.state === "observed" && stateStore.read().coreSetupComplete === true) {
+      startCatalogVerificationMonitor({ logger, stateStore });
+    }
+    return evidence;
+  });
+  trustedHandle("launcher:catalog-defer", () => {
+    const current = stateStore.read();
+    if (current.coreSetupComplete !== true) throw new Error("Install the local integration before deferring catalog verification");
+    if (runtimeHost.currentOperation()) throw new Error("Wait for the active operation before continuing setup");
+    const state = stateStore.update({ catalogCheckDeferred: true });
+    send("launcher:state-changed", state);
+    logger.info("codex.catalog_check_deferred", { userSelected: true });
+    return state;
+  });
+  // The existing handle() sender guard allows only our local renderer, never
+  // the signed-in web view. This opens local tools, not a new debug listener.
+  handle("launcher:open-devtools", () => {
+    mainWindow.webContents.openDevTools({ mode: "detach" });
+  });
+  handle("launcher:export-logs", async () => {
+    const date = new Date().toISOString().slice(0, 10);
+    const copy = nativeCopyFor(stateStore.read().language);
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: copy.exportDiagnostics,
+      defaultPath: path.join(app.getPath("documents"), `star-moon-diagnostics-${date}.jsonl`),
+      filters: [{ name: "JSON Lines", extensions: ["jsonl"] }],
+    });
+    if (result.canceled || !result.filePath) return null;
+    const recordCount = exportSanitizedLogs({
+      filePath: logger.filePath,
+      destinationPath: result.filePath,
+    });
+    logger.info("launcher.logs_exported", { recordCount });
+    return result.filePath;
+  });
+  handle("launcher:update-install", async () => {
+    if (!updateController) throw new Error("Launcher updates are unavailable");
+    const launch = await updateController.beginInstall();
+    const result = await requestQuit();
+    if (!result.ok) {
+      updateController.cancelInstall(launch);
+      throw new Error(result.message);
+    }
+    return true;
+  });
+  handle("launcher:window-state", (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    return windowStateSnapshot(window);
+  });
+  ipcMain.on("launcher:window-control", (event, action) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window || window.isDestroyed()) return;
+    if (action === "close") window.close();
+    else if (action === "minimize") window.minimize();
+    else if (action === "zoom") window.isMaximized() ? window.unmaximize() : window.maximize();
+  });
+}
+
+async function requestQuit() {
+  if (shutdownInProgress || exitCommitted) {
+    return { ok: false, message: "Launcher shutdown is already in progress" };
+  }
+  shutdownInProgress = true;
+  try {
+    if (browserHost?.currentOperation() === "ChatGPT login") await browserHost.cancelLogin();
+    if (runtimeHost?.currentOperation() === "passkey-login" && !runtimeHost.passkeyContinuationRequested) {
+      runtimeHost.cancelPasskeyLogin();
+      await browserHost?.loginOperation?.catch(() => {});
+    }
+    const activeOperation = runtimeHost?.currentOperation() || browserHost?.currentOperation();
+    if (activeOperation) {
+      throw new Error(`Wait for ${activeOperation} to finish before quitting Codex Web GPT`);
+    }
+    await copyLogin?.cancel();
+    await runtimeSupervisor?.shutdown({ cancelActiveTurns: true, force: true });
+    stopCatalogVerificationMonitor();
+    quitting = true;
+    await browserHost?.persistSession();
+    browserHost?.destroy();
+    await browserControl?.close();
+    await agentDockBridge?.close();
+    await moonLetterSession?.close();
+    exitCommitted = true;
+    app.quit();
+    return { ok: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    quitting = false;
+    showMainWindow();
+    publishOperation({ name: "launcher-quit", status: "failed", message });
+    return { ok: false, message };
+  } finally {
+    shutdownInProgress = false;
+  }
+}
+
+async function start() {
+  const gotLock = app.requestSingleInstanceLock();
+  if (!gotLock) {
+    app.quit();
+    return;
+  }
+  app.on("second-instance", (_event, argv) => {
+    showMainWindow();
+    const verifyId = argv.find(value => /^--codex-copy-verify=[a-f0-9-]{36}$/.test(value))?.split("=")[1];
+    if (verifyId) {
+      if (copyLogin) void copyLogin.begin(verifyId, { verifySaved: true }).catch(() => {});
+      else pendingCopyVerify = verifyId;
+      return;
+    }
+    const id = argv.find(value => /^--codex-copy-login=[a-f0-9-]{36}$/.test(value))?.split("=")[1];
+    if (id) {
+      if (copyLogin) void copyLogin.begin(id).catch(() => {});
+      else pendingCopyLogin = id;
+    }
+  });
+
+  await waitForPackagedRuntimeSource({ app, resourcesPath: process.resourcesPath });
+  let installedRuntimeRoot = null;
+  let runtimeRootResolved = false;
+  const runtimeRootProvider = () => {
+    const packagedRuntimeWasRemoved = app.isPackaged
+      && (!installedRuntimeRoot || !fs.existsSync(installedRuntimeRoot));
+    if (!runtimeRootResolved || packagedRuntimeWasRemoved) {
+      installedRuntimeRoot = ensurePackagedRuntime({
+        app,
+        coreHome: CORE_HOME,
+        resourcesPath: process.resourcesPath,
+      });
+      runtimeRootResolved = true;
+    }
+    return installedRuntimeRoot;
+  };
+  installedRuntimeRoot = runtimeRootProvider();
+
+  cdpPort = await findFreePort();
+  if (process.platform === "linux") {
+    app.commandLine.appendSwitch("class", LAUNCHER_PROFILE.windowClass);
+    app.commandLine.appendSwitch("disable-gpu");
+    app.commandLine.appendSwitch("disable-gpu-compositing");
+    app.commandLine.appendSwitch("disable-features", "VaapiVideoDecoder,VaapiVideoEncoder");
+    app.commandLine.appendSwitch("use-gl", "swiftshader");
+  }
+  app.commandLine.appendSwitch("remote-debugging-address", "127.0.0.1");
+  app.commandLine.appendSwitch("remote-debugging-port", String(cdpPort));
+  // Opt-in native UI QA: allow this instance's own loopback DevTools frontend,
+  // never arbitrary websites. Normal launches do not widen the origin policy.
+  if (process.argv.includes("--local-debug-window")) {
+    app.commandLine.appendSwitch("remote-allow-origins", `http://127.0.0.1:${cdpPort}`);
+  }
+
+  await app.whenReady();
+
+  const stateStore = createStateStore(path.join(app.getPath("userData"), "launcher-state.json"));
+  if (IS_DEV_PROFILE && !stateStore.read().onboardingComplete) {
+    stateStore.update({
+      language: stateStore.read().language || "en",
+      onboardingComplete: true,
+      autoStart: false,
+    });
+  }
+  if (stateStore.read().sessionRefreshReminderAt === null) {
+    stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
+  }
+  const persistedState = stateStore.read();
+  if (persistedState.coreSetupComplete === true && persistedState.codexCatalogVerified === undefined) {
+    stateStore.update({
+      coreSetupComplete: false,
+      codexCatalogVerified: false,
+      codexRestartRequired: false,
+    });
+  }
+  const autostart = IS_DEV_PROFILE ? { supported: false, enabled: false } : getAutostart(app);
+  if (!IS_DEV_PROFILE
+    && stateStore.read().onboardingComplete
+    && autostart.supported
+    && stateStore.read().autoStart !== autostart.enabled) {
+    setAutostart(app, stateStore.read().autoStart);
+  }
+  const logger = createLogger({
+    filePath: path.join(app.getPath("logs"), "launcher.jsonl"),
+    publish: (record) => send("launcher:log", record),
+  });
+  const startHidden = process.argv.includes("--hidden") && stateStore.read().onboardingComplete;
+  nativeTheme.themeSource = "system";
+  mainWindow = createWindow({
+    logger,
+    stateStore,
+    windowStatePath: path.join(app.getPath("userData"), "window-state.json"),
+    startHidden,
+  });
+  browserControl = await new BrowserControlServer({
+    logger,
+    getBrowserHost: () => browserHost,
+    getPreferences: () => stateStore.read(),
+  }).start();
+  runtimeSupervisor = new RuntimeSupervisor({
+    app,
+    logger,
+    sourceRoot: SOURCE_ROOT,
+    installedRuntimeRoot,
+    runtimeRootProvider,
+    coreHome: CORE_HOME,
+    browserDescriptorPath: BROWSER_DESCRIPTOR_PATH,
+    launcherProfile: LAUNCHER_PROFILE.kind,
+    publishOperation,
+  });
+  runtimeHost = new RuntimeHost({
+    app,
+    logger,
+    sourceRoot: SOURCE_ROOT,
+    installedRuntimeRoot,
+    runtimeRootProvider,
+    browserDescriptorPath: BROWSER_DESCRIPTOR_PATH,
+    coreHome: CORE_HOME,
+    codexHome: LAUNCHER_PROFILE.codexHome,
+    launcherProfile: LAUNCHER_PROFILE.kind,
+    publishOperation,
+    supervisor: runtimeSupervisor,
+    getBrowserInteractionMode: () => stateStore.read().browserInteractionMode,
+  });
+  copies = new CodexCopies({ root: path.join(CORE_HOME, "codex-copies"), logger,
+    engine: runtimeHost.command([]).executable, buildCatalog: (template, targetConfig) => runtimeHost.copyCatalog(template, targetConfig) });
+  copyLogin = new CodexCopyLogin({ copies, window: mainWindow, logger, showWindow: showMainWindow,
+    publish: state => send("launcher:codex-copy-login-changed", state),
+    beforeOpen: async () => {
+      if (browserHost?.currentOperation() || browserHost?.activeTraceId) throw new Error("SM_COPY_LOGIN_BROWSER_BUSY");
+      await browserHost?.setSurfaceActive(false);
+    },
+    createView: partition => new WebContentsView({ webPreferences: { partition, nodeIntegration: false,
+      contextIsolation: true, sandbox: true, webSecurity: true, devTools: false, safeDialogs: true } }),
+  });
+  const configuredInteractionMode = runtimeHost.runtimeConfigSnapshot().config?.browserInteractionMode;
+  if ((configuredInteractionMode === "automatic" || configuredInteractionMode === "manual")
+    && stateStore.read().browserInteractionMode !== configuredInteractionMode) {
+    stateStore.update({ browserInteractionMode: configuredInteractionMode });
+  }
+  browserHost = new BrowserHost({
+    window: mainWindow,
+    descriptorPath: BROWSER_DESCRIPTOR_PATH,
+    cdpPort,
+    control: browserControl.descriptor(),
+    cancelTurn: IS_DEV_PROFILE ? undefined : traceId => runtimeSupervisor.cancelBrowserTurn(traceId),
+    getConnectorName: () => runtimeHost.browserConnectorName(),
+    helper: { executable: process.execPath, script: BROWSER_HELPER_PATH },
+    logger,
+    loginWithPasskey: () => runtimeHost.capturePasskeyLogin(),
+    partition: LAUNCHER_PROFILE.browserPartition,
+    profile: LAUNCHER_PROFILE.kind,
+    publishState: (state) => send("launcher:browser-state", state),
+    showWindow: showMainWindow,
+    getBrowserInteractionMode: () => stateStore.read().browserInteractionMode,
+    initialZoomFactor: stateStore.read().browserZoomFactor,
+  });
+  await browserHost.ready();
+  const persistedBrowserState = stateStore.read();
+  if (persistedBrowserState.guidedSetupComplete === true && persistedBrowserState.browserVisible === true) {
+    await browserHost.reveal(false).catch((error) => {
+      logger.warn("browser.persisted_surface_restore_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+  }
+  const updaterRuntimeRoot = runtimeRootProvider();
+  updateController = createUpdateController({
+    enabled: FORK_UPDATES_READY,
+    currentVersion: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    packaged: app.isPackaged && !IS_DEV_PROFILE,
+    executablePath: process.execPath,
+    runtimeExecutable: updaterRuntimeRoot
+      ? runtimeBundlePaths(updaterRuntimeRoot, process.platform).executable
+      : null,
+    logsDirectory: app.getPath("logs"),
+    publish: (state) => send("launcher:update-state", state),
+    logger,
+  });
+  registerIpc({ logger, stateStore });
+  const trayAvailable = createTray(logger, stateStore.read().language);
+  if (startHidden && !trayAvailable) mainWindow.once("ready-to-show", () => showMainWindow());
+  const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");
+  let startupAuthenticationRefresh = Promise.resolve();
+  if (!launcherSmokeTest && stateStore.read().browserInteractionMode === "automatic") {
+    startupAuthenticationRefresh = browserHost.refreshAuthentication().catch((error) => {
+      logger.warn("browser.session_refresh_failed", {
+        ...navigationErrorForLog(error),
+      });
+    });
+  }
+  await loadRenderer(mainWindow);
+  if (pendingCopyVerify && !launcherSmokeTest) {
+    const id = pendingCopyVerify; pendingCopyVerify = null; pendingCopyLogin = null;
+    void startupAuthenticationRefresh.then(() => copyLogin.begin(id, { verifySaved: true })).catch(() => {});
+  } else if (pendingCopyLogin && !launcherSmokeTest) {
+    const id = pendingCopyLogin; pendingCopyLogin = null;
+    void startupAuthenticationRefresh.then(() => copyLogin.begin(id)).catch(() => {});
+  }
+  if (!launcherSmokeTest) void updateController.checkOnce();
+  if (launcherSmokeTest) {
+    const smokeRuntimeRoot = runtimeRootProvider();
+    if (app.isPackaged && !smokeRuntimeRoot) {
+      throw new Error("Packaged launcher smoke test could not install its durable runtime");
+    }
+    const versionInvocation = runtimeSupervisor.runtimeCommand(["--version"]);
+    const versionResult = spawnSync(versionInvocation.executable, versionInvocation.args, {
+      cwd: versionInvocation.cwd,
+      encoding: "utf8",
+      timeout: 30_000,
+      windowsHide: true,
+    });
+    if (versionResult.error) throw versionResult.error;
+    if (versionResult.status !== 0 || versionResult.stdout.trim() !== app.getVersion()) {
+      throw new Error(
+        `Installed launcher runtime is not executable`
+        + ` (status=${versionResult.status ?? "unknown"}, stdout=${JSON.stringify(versionResult.stdout.trim())},`
+        + ` stderr=${JSON.stringify(versionResult.stderr.trim())})`,
+      );
+    }
+    const markerPath = process.env.STAR_MOON_SMOKE_FILE?.trim();
+    if (!markerPath || !path.isAbsolute(markerPath)) {
+      throw new Error("Packaged launcher smoke test requires an absolute STAR_MOON_SMOKE_FILE");
+    }
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, `${JSON.stringify({
+      ok: true,
+      version: app.getVersion(),
+      platform: process.platform,
+      packaged: app.isPackaged,
+      runtimeVerified: true,
+    })}\n`);
+    browserHost.destroy();
+    await browserControl.close();
+    mainWindow.destroy();
+    app.quit();
+    return;
+  }
+  if (IS_DEV_PROFILE) {
+    let config = null;
+    try {
+      config = runtimeSupervisor.readConfig();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error("dev_profile.config_invalid", { message });
+      publishOperation({ name: "dev-profile", status: "failed", message });
+    }
+    const state = stateStore.update({
+      coreSetupComplete: Boolean(config),
+      codexCatalogVerified: Boolean(config),
+      mcpRuntimeInstalled: config?.mode === "full",
+      ...(config?.mode !== "full" ? { mcpSetupComplete: false, mcpGuideStep: 0 } : {}),
+      codexRestartRequired: false,
+      autoStart: false,
+      experimentalBiggerContext: config?.experimentalBiggerContext === true,
+      zeroRiskProEnabled: config?.zeroRiskProEnabled === true,
+    });
+    send("launcher:state-changed", state);
+    logger.info("dev_profile.ready", {
+      configured: Boolean(config),
+      mode: config?.mode || null,
+      coreHome: CORE_HOME,
+      userData: launcherUserData,
+    });
+    if (config?.mode === "full") {
+      void startupAuthenticationRefresh.then(() => runtimeSupervisor.startIfConfigured()).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error("dev_profile.runtime_start_failed", { message });
+        const failed = stateStore.update({ mcpSetupComplete: false });
+        send("launcher:state-changed", failed);
+      });
+    }
+  } else void (async () => {
+    await startupAuthenticationRefresh;
+    const upgrade = await runtimeHost.upgradeManagedRuntime();
+    if (upgrade.updated) {
+      const state = stateStore.update({
+        coreSetupComplete: true,
+        codexCatalogVerified: false,
+        codexRestartRequired: true,
+        experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
+        zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
+        ...(upgrade.mode === "full" ? {
+          mcpRuntimeInstalled: true,
+          mcpSetupComplete: false,
+          mcpGuideStep: 2,
+        } : {
+          mcpRuntimeInstalled: false,
+          mcpSetupComplete: false,
+          mcpGuideStep: 0,
+        }),
+      });
+      send("launcher:state-changed", state);
+      logger.info("runtime.release_upgraded", {
+        fromVersion: upgrade.fromVersion,
+        toVersion: upgrade.toVersion,
+        mode: upgrade.mode,
+        connectorMigrated: upgrade.connectorMigrated,
+      });
+    }
+    const configuredRuntime = runtimeHost.runtimeConfigSnapshot();
+    if (configuredRuntime.configured) {
+      const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
+      const zeroRiskProEnabled = configuredRuntime.config?.zeroRiskProEnabled === true;
+      const saved = stateStore.read();
+      if (saved.experimentalBiggerContext !== enabled
+        || saved.zeroRiskProEnabled !== zeroRiskProEnabled) {
+        const state = stateStore.update({ experimentalBiggerContext: enabled, zeroRiskProEnabled });
+        send("launcher:state-changed", state);
+      }
+    }
+    const runtime = await runtimeSupervisor.startIfConfigured();
+    if (runtime.status !== "ready") return runtime;
+    const route = await runtimeHost.connectBridgeRoute();
+    return { ...runtime, bridgeRouteChanged: route.changed === true };
+  })().then(async (runtime) => {
+    if (runtime.status === "ready") {
+      const config = runtimeSupervisor.readConfig();
+      const current = stateStore.read();
+      const patch = {
+        coreSetupComplete: true,
+        mcpRuntimeInstalled: config.mode === "full",
+        experimentalBiggerContext: config.experimentalBiggerContext === true,
+        zeroRiskProEnabled: config.zeroRiskProEnabled === true,
+        ...(runtime.bridgeRouteChanged ? {
+          codexCatalogVerified: false,
+          codexRestartRequired: true,
+        } : {}),
+        ...(config.mode === "browser-only" ? {
+          mcpSetupComplete: false,
+          mcpGuideStep: 0,
+        } : {}),
+      };
+      if (Object.entries(patch).some(([key, value]) => current[key] !== value)) {
+        const state = stateStore.update(patch);
+        send("launcher:state-changed", state);
+      }
+      startCatalogVerificationMonitor({ logger, stateStore });
+      return;
+    }
+    if (runtime.status === "not-configured") {
+      const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+      const current = stateStore.read();
+      if (current.coreSetupComplete || current.mcpRuntimeInstalled || current.mcpSetupComplete) {
+        const state = stateStore.update({
+          coreSetupComplete: false,
+          codexCatalogVerified: false,
+          mcpRuntimeInstalled: false,
+          mcpSetupComplete: false,
+          mcpGuideStep: 0,
+        });
+        send("launcher:state-changed", state);
+      }
+      if (routeRecovery.error) {
+        publishOperation({
+          name: "runtime-start",
+          status: "failed",
+          message: `Local runtime is not configured; restoring the previous Codex route also failed: ${routeRecovery.error}`,
+        });
+      }
+      return;
+    }
+    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+    // A failed process start does not uninstall the core. Preserve the install
+    // receipt and recovery page; current runtime/catalog checks still fail closed.
+    const state = stateStore.update({ codexCatalogVerified: false });
+    send("launcher:state-changed", state);
+    if (runtime.status === "external" || runtime.status === "needs-setup") {
+      const detail = runtime.detail || (
+        runtime.status === "external"
+          ? "Another process owns the configured Codex Web GPT runtime"
+          : "The installed runtime configuration must be repaired from Setup"
+      );
+      publishOperation({
+        name: "runtime-start",
+        status: "failed",
+        message: routeRecovery.error
+          ? `${detail}; restoring the previous Codex route also failed: ${routeRecovery.error}`
+          : routeRecovery.restored
+            ? `${detail}; the previous Codex route was restored, restart Codex once`
+            : detail,
+      });
+    }
+  }).catch(async (error) => {
+    const primary = error instanceof Error ? error.message : String(error);
+    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+    const message = routeRecovery.error
+      ? `${primary}; restoring the previous Codex route also failed: ${routeRecovery.error}`
+      : routeRecovery.restored
+        ? `${primary}; the previous Codex route was restored, restart Codex once`
+        : primary;
+    logger.error("runtime.startup_failed", { message });
+    const state = stateStore.update({ codexCatalogVerified: false });
+    send("launcher:state-changed", state);
+    publishOperation({ name: "runtime-start", status: "failed", message });
+  });
+
+  app.on("activate", () => showMainWindow());
+  app.on("before-quit", (event) => {
+    if (exitCommitted) return;
+    event.preventDefault();
+    void requestQuit();
+  });
+  process.once("SIGINT", () => { void requestQuit(); });
+  process.once("SIGTERM", () => { void requestQuit(); });
+}
+
+void start().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    fs.appendFileSync(path.join(app.getPath("logs"), "launcher-fatal.log"), `${new Date().toISOString()} ${error?.stack || error}\n`);
+  } catch {}
+  try {
+    if (!process.argv.includes("--launcher-smoke-test")) dialog.showErrorBox("Star Moon could not start", message);
+  } catch {}
+  app.exit(1);
+});

@@ -1,0 +1,24 @@
+.codex-copies { margin: 24px 0; padding: 16px; border: 1px solid var(--color-border-heavy); border-radius: 9px; background: var(--color-background-control); font-size: 13px; line-height: 1.65; }
+.codex-copies summary { cursor: pointer; font-size: 16px; }
+.codex-copies p { margin-block: 12px; }
+.codex-copy-boundary { color: var(--color-text-secondary); font-size: 12px; }
+.codex-copy-form { display: grid; gap: 12px; }
+.codex-copy-form label { display: grid; gap: 5px; }
+.codex-copy-form input,.codex-copy-form select { width: 100%; min-height: 40px; border: 1px solid var(--color-border-heavy); border-radius: 5px; padding: 8px 10px; background: var(--color-background-control); color: var(--color-text-primary); font: inherit; }
+.codex-copy-form button { min-height: 40px; padding: 8px 12px; }
+.codex-copy-archive-toggle { display: flex; align-items: center; gap: 7px; margin-top: 16px; }
+.codex-copy-list { list-style: none; padding: 0; margin: 18px 0 0; }
+.codex-copy-list li { border-top: 1px solid var(--color-border-heavy); padding-block: 15px; }
+.codex-copy-list header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; }
+.codex-copy-list dl { margin: 10px 0; font-size: 11px; }
+.codex-copy-list dt { color: var(--color-text-secondary); }
+.codex-copy-list dd { margin: 0 0 8px; overflow-wrap: anywhere; }
+.codex-copy-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.codex-copy-actions button { border: 1px solid var(--color-border-heavy); border-radius: 5px; padding: 7px 10px; min-height: 36px; }
+.codex-copy-login-pane { position: fixed; z-index: 1000; inset: 32px 12px 12px; display: flex; flex-direction: column; gap: 10px; padding: 18px; border: 1px solid var(--color-border-heavy); border-radius: 10px; background: var(--color-background-elevated); color: var(--color-text-primary); box-shadow: 0 12px 80px #0006; }
+.codex-copy-login-pane header { display: flex; justify-content: space-between; align-items: start; gap: 18px; flex: none; }
+.codex-copy-login-pane header p { margin-block: 6px; font-size: 13px; }
+.codex-copy-login-pane header code { font-size: 12px; }
+.codex-copy-login-pane header button { min-height: 40px; padding: 8px 14px; border: 1px solid var(--color-border-heavy); border-radius: 5px; flex: none; }
+.codex-copy-login-privacy { margin: 0; font-size: 12px; line-height: 1.6; flex: none; }
+.codex-copy-login-slot { flex: 1; min-height: 160px; background: white; border-radius: 7px; overflow: hidden; }

@@ -1,0 +1,499 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { chromium, type BrowserContext, type BrowserContextOptions } from "playwright-core";
+import type { AppConfig } from "./config";
+import { atomicWriteFile } from "./config";
+import {
+  assertAuthenticatedChatGptPage,
+  assertPersistentChatPage,
+  CHATGPT_CHAT_URL,
+  detectChatGptAccountCapabilities,
+} from "./chatgpt-session";
+import type { ChatGptWebAccountCapabilities } from "./chatgpt-web-models";
+
+export interface BrowserLoginResult {
+  storageStatePath: string;
+  accountSurfaceUrl: string;
+  solAvailable: boolean;
+  proAvailable: boolean;
+}
+
+export type BrowserLoginStorageState = Awaited<ReturnType<BrowserContext["storageState"]>>;
+
+export interface SystemBrowserLoginCaptureMarker {
+  version: 1;
+  captureComplete: true;
+  source: "isolated-normal-browser-profile";
+  capturedAt: string;
+}
+
+export interface SystemBrowserLoginCapture {
+  storageState: BrowserLoginStorageState;
+  marker: SystemBrowserLoginCaptureMarker;
+}
+
+interface SystemBrowserLoginOptions {
+  continuation: Promise<void>;
+  timeoutMs?: number;
+}
+
+interface LoginVerificationMarker {
+  version: 1;
+  authenticated: true;
+  verifiedAt: string;
+  solAvailable?: boolean;
+  proAvailable?: boolean;
+}
+
+const SYSTEM_LOGIN_TIMEOUT_MS = 10 * 60_000;
+const SYSTEM_LOGIN_STOP_TIMEOUT_MS = 5_000;
+const LOGIN_STORAGE_ROOT_DOMAINS = ["chatgpt.com", "openai.com"] as const;
+const CHATGPT_ORIGIN = new URL(CHATGPT_CHAT_URL).origin;
+
+export function browserLoginProfileParent(executable: string, storageStatePath: string, platform = process.platform, homeDir = homedir()): string {
+  // Snap cannot access arbitrary hidden folders under the user's home. Keep
+  // only our dedicated profile in its permitted common directory, never in
+  // Chromium's normal user-data directory.
+  return platform === "linux" && executable === "/snap/bin/chromium"
+    ? join(homeDir, "snap", "chromium", "common", "star-moon-login")
+    : dirname(storageStatePath);
+}
+
+function browserProcessExited(browser: ChildProcess): boolean {
+  return browser.exitCode !== null || browser.signalCode !== null;
+}
+
+function removeTemporaryChromeTabSessions(profileDir: string): void {
+  const defaultProfile = join(profileDir, "Default");
+  rmSync(join(defaultProfile, "Sessions"), { recursive: true, force: true });
+  for (const name of ["Current Session", "Current Tabs", "Last Session", "Last Tabs"]) {
+    rmSync(join(defaultProfile, name), { force: true });
+  }
+}
+
+async function waitForBrowserExit(browser: ChildProcess, timeoutMs: number): Promise<boolean> {
+  if (browserProcessExited(browser)) return true;
+  return await new Promise(resolve => {
+    let settled = false;
+    const finish = (exited: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      browser.off("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    browser.once("exit", onExit);
+    if (browserProcessExited(browser)) finish(true);
+  });
+}
+
+async function stopOwnedLoginBrowser(browser: ChildProcess): Promise<void> {
+  if (browserProcessExited(browser) || !Number.isInteger(browser.pid)) return;
+  const graceful = waitForBrowserExit(browser, SYSTEM_LOGIN_STOP_TIMEOUT_MS);
+  if (!browser.kill() && !browserProcessExited(browser)) {
+    throw new Error("The dedicated Chrome login process refused to close");
+  }
+  if (await graceful) return;
+  const forced = waitForBrowserExit(browser, SYSTEM_LOGIN_STOP_TIMEOUT_MS);
+  if (!browser.kill("SIGKILL") && !browserProcessExited(browser)) {
+    throw new Error("The dedicated Chrome login process refused forced termination");
+  }
+  if (!await forced) throw new Error("The dedicated Chrome login process did not exit");
+}
+
+function allowedLoginStorageHost(rawHostname: string): boolean {
+  const hostname = rawHostname.toLowerCase();
+  if (!/^[a-z0-9.-]+$/.test(hostname)
+    || hostname.startsWith(".")
+    || hostname.endsWith(".")
+    || hostname.includes("..")) return false;
+  try {
+    const parsed = new URL(`https://${hostname}/`);
+    if (parsed.hostname !== hostname
+      || parsed.host !== hostname
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash) return false;
+  } catch {
+    return false;
+  }
+  return LOGIN_STORAGE_ROOT_DOMAINS.some(root => hostname === root || hostname.endsWith(`.${root}`));
+}
+
+export function sanitizeBrowserLoginStorageState(
+  storageState: BrowserLoginStorageState,
+): BrowserLoginStorageState {
+  return {
+    cookies: storageState.cookies
+      .filter(cookie => !Object.prototype.hasOwnProperty.call(cookie, "partitionKey")
+        && allowedLoginStorageHost(cookie.domain.replace(/^\.+/, "")))
+      .map(cookie => ({ ...cookie })),
+    origins: storageState.origins
+      .filter(origin => origin.origin === CHATGPT_ORIGIN)
+      .map(origin => ({
+        origin: origin.origin,
+        localStorage: origin.localStorage.map(item => ({ ...item })),
+      })),
+  };
+}
+
+export function loginVerificationMarkerPath(storageStatePath: string): string {
+  return `${storageStatePath}.verified.json`;
+}
+
+function writeVerificationMarker(
+  storageStatePath: string,
+  capabilities: ChatGptWebAccountCapabilities,
+): void {
+  const marker: LoginVerificationMarker = {
+    version: 1,
+    authenticated: true,
+    verifiedAt: new Date().toISOString(),
+    ...capabilities,
+  };
+  atomicWriteFile(loginVerificationMarkerPath(storageStatePath), `${JSON.stringify(marker)}\n`);
+}
+
+async function inspectStoredState(
+  config: AppConfig,
+  storageState: NonNullable<BrowserContextOptions["storageState"]>,
+): Promise<ChatGptWebAccountCapabilities & { url: string }> {
+  const verifierBrowser = await chromium.launch({
+    executablePath: config.chromeExecutablePath,
+    headless: false,
+    ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
+    args: ["--no-first-run", "--no-default-browser-check"],
+  });
+  try {
+    const verifierContext = await verifierBrowser.newContext({ storageState });
+    try {
+      const verifierPage = await verifierContext.newPage();
+      await verifierPage.goto(CHATGPT_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await verifierPage.getByRole("textbox", { name: "Chat with ChatGPT" }).waitFor({ state: "visible", timeout: 60_000 });
+      await assertAuthenticatedChatGptPage(verifierPage);
+      await assertPersistentChatPage(verifierPage);
+      return { ...await detectChatGptAccountCapabilities(verifierPage), url: verifierPage.url() };
+    } finally {
+      await verifierContext.close();
+    }
+  } finally {
+    await verifierBrowser.close();
+  }
+}
+
+export async function inspectBrowserLoginCapabilities(config: AppConfig): Promise<ChatGptWebAccountCapabilities> {
+  if (!browserLoginStateExists(config)) throw new Error("ChatGPT login state is missing or unverified");
+  const inspected = await inspectStoredState(config, config.storageStatePath);
+  writeVerificationMarker(config.storageStatePath, inspected);
+  return { solAvailable: inspected.solAvailable, proAvailable: inspected.proAvailable };
+}
+
+export function storedBrowserLoginCapabilities(
+  config: AppConfig,
+): Partial<ChatGptWebAccountCapabilities> {
+  if (!browserLoginStateExists(config)) return {};
+  try {
+    const marker = JSON.parse(readFileSync(loginVerificationMarkerPath(config.storageStatePath), "utf8")) as Partial<LoginVerificationMarker>;
+    return {
+      ...(typeof marker.solAvailable === "boolean" ? { solAvailable: marker.solAvailable } : {}),
+      ...(typeof marker.proAvailable === "boolean" ? { proAvailable: marker.proAvailable } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+export async function captureSystemBrowserLogin(
+  config: Pick<AppConfig, "chromeExecutablePath" | "storageStatePath">,
+  options: SystemBrowserLoginOptions,
+): Promise<SystemBrowserLoginCapture> {
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    throw new Error("External browser sign-in is currently supported only on macOS and Linux");
+  }
+  if (!existsSync(config.chromeExecutablePath)) {
+    throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}`);
+  }
+  const timeoutMs = options.timeoutMs ?? SYSTEM_LOGIN_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 1) {
+    throw new Error("Passkey sign-in timeout must be a positive finite number");
+  }
+  const deadline = Date.now() + timeoutMs;
+  const remainingTime = () => {
+    const remaining = deadline - Date.now();
+    if (remaining < 1) throw new Error("Timed out waiting for passkey sign-in");
+    return remaining;
+  };
+
+  const profileParent = browserLoginProfileParent(config.chromeExecutablePath, config.storageStatePath);
+  mkdirSync(profileParent, { recursive: true, mode: 0o700 });
+  try { chmodSync(profileParent, 0o700); } catch {}
+  // Keep one Star Moon-owned profile across login handoffs.  The profile is
+  // still isolated from the user's normal Chrome profile, but its cookies can
+  // be reused after the first successful sign-in instead of being discarded
+  // with a temporary directory after every attempt.
+  const profileDir = join(profileParent, "login-profile");
+  mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  try { chmodSync(profileDir, 0o700); } catch {}
+  process.stdout.write(
+    "Sign in normally in the dedicated browser window. When ChatGPT is ready, return to Star Moon and authorize the session handoff. No debugging connection is attached during sign-in.\n",
+  );
+
+  let capture: SystemBrowserLoginCapture | undefined;
+  let context: BrowserContext | undefined;
+  let primaryError: unknown;
+  let loginBrowser: ChildProcess | undefined;
+  const userClosesBrowser = process.platform === "linux" && config.chromeExecutablePath === "/snap/bin/chromium";
+  try {
+    loginBrowser = spawn(config.chromeExecutablePath, [
+      `--user-data-dir=${profileDir}`,
+      "--new-window",
+      "--disable-background-mode",
+      "--no-first-run",
+      "--no-default-browser-check",
+      CHATGPT_CHAT_URL,
+    ], { env: process.env, stdio: "ignore" });
+    const ownedBrowser = loginBrowser;
+    let continuationRequested = false;
+    let normalWindowClosed = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Timed out waiting for passkey sign-in")), remainingTime());
+        void options.continuation.then(() => {
+          continuationRequested = true;
+          if (normalWindowClosed) { resolve(); return; }
+          if (userClosesBrowser) {
+            process.stdout.write("Close the dedicated Chromium login window to finish the authorized handoff. Your normal browser windows are not involved.\n");
+            return;
+          }
+          try {
+            if (!ownedBrowser.kill() && !browserProcessExited(ownedBrowser)) reject(new Error("The dedicated browser refused to close; close its window to continue"));
+          } catch (error) { reject(error); }
+        }, reject);
+        ownedBrowser.once("error", reject);
+        ownedBrowser.once("exit", (code, signal) => {
+          if (continuationRequested) resolve();
+          else if (signal) reject(new Error(`Dedicated Chrome login exited from signal ${signal}`));
+          else if (code === 0) {
+            normalWindowClosed = true;
+            process.stdout.write("The dedicated browser is closed. Return to Star Moon to authorize this session handoff.\n");
+          }
+          else reject(new Error(`Dedicated Chrome login exited with status ${code ?? 1}`));
+        });
+      });
+    } catch (error) {
+      try {
+        if (userClosesBrowser && !browserProcessExited(ownedBrowser)) {
+          throw new Error("Close the dedicated Chromium window to finish cancellation. Its private temporary profile is retained until the browser is closed");
+        }
+        await stopOwnedLoginBrowser(ownedBrowser);
+      } catch (cleanupError) {
+        const primary = error instanceof Error ? error.message : String(error);
+        const cleanup = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        throw new Error(`${primary}; Chrome cleanup also failed: ${cleanup}`);
+      }
+      throw error;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+
+    // Authentication happens before Playwright ever owns this profile. Chrome does not load
+    // session-only cookies after a normal restart unless session restore is requested. Remove only
+    // the dedicated profile's tab-session files first, so restoring cookies cannot reopen the
+    // authenticated or identity-provider pages during the offline capture.
+    removeTemporaryChromeTabSessions(profileDir);
+    context = await chromium.launchPersistentContext(profileDir, {
+      executablePath: config.chromeExecutablePath,
+      headless: true,
+      chromiumSandbox: true,
+      offline: true,
+      serviceWorkers: "block",
+      ignoreDefaultArgs: [
+        "--no-sandbox",
+        "--enable-automation",
+        "--password-store=basic",
+        "--use-mock-keychain",
+      ],
+      args: [
+        "--disable-background-mode",
+        "--disable-background-networking",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--restore-last-session",
+      ],
+      timeout: Math.min(30_000, remainingTime()),
+    });
+    await context.setOffline(true);
+    await context.route("**/*", route => route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: "<!doctype html><meta charset=\"utf-8\"><title>Private login-state capture</title>",
+    }));
+    const page = context.pages()[0] ?? await context.newPage();
+    await page.goto(CHATGPT_CHAT_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: Math.min(60_000, remainingTime()),
+    });
+    if (new URL(page.url()).origin !== CHATGPT_ORIGIN) {
+      throw new Error("Offline passkey-state capture reached an unexpected origin");
+    }
+    const storageState = sanitizeBrowserLoginStorageState(await context.storageState());
+    if (storageState.cookies.length === 0) {
+      throw new Error("The dedicated Chrome profile contains no ChatGPT/OpenAI cookies");
+    }
+    capture = {
+      storageState,
+      marker: {
+        version: 1,
+        captureComplete: true,
+        source: "isolated-normal-browser-profile",
+        capturedAt: new Date().toISOString(),
+      },
+    };
+  } catch (error) {
+    primaryError = error;
+  }
+
+  let cleanupError: unknown;
+  try {
+    if (context && !context.isClosed()) await context.close();
+  } catch (error) {
+    cleanupError = error;
+  }
+  try {
+    if (loginBrowser && !browserProcessExited(loginBrowser)) {
+      cleanupError ??= new Error("The dedicated browser is still running. Close its window; the Star Moon login profile was retained and was not imported");
+    // The dedicated profile is persistent by design. Never remove it here;
+    // it contains only the user's Star Moon login session and is reused by
+    // the next handoff. Failed captures retain the profile so the user can
+    // retry without signing in again.
+    }
+  } catch (error) {
+    cleanupError ??= error;
+  }
+  if (primaryError) {
+    if (cleanupError) {
+      throw new Error(
+        `${primaryError instanceof Error ? primaryError.message : String(primaryError)}; login-profile cleanup also failed:`
+        + ` ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+      );
+    }
+    throw primaryError;
+  }
+  if (cleanupError) throw cleanupError;
+  if (!capture) throw new Error("Passkey sign-in completed without capture evidence");
+  return capture;
+}
+
+export async function captureSystemBrowserLoginToFile(
+  config: Pick<AppConfig, "chromeExecutablePath" | "storageStatePath">,
+  options: SystemBrowserLoginOptions,
+): Promise<void> {
+  const capture = await captureSystemBrowserLogin(config, options);
+  const markerPath = loginVerificationMarkerPath(config.storageStatePath);
+  rmSync(markerPath, { force: true });
+  atomicWriteFile(config.storageStatePath, `${JSON.stringify(capture.storageState)}\n`);
+  atomicWriteFile(markerPath, `${JSON.stringify(capture.marker)}\n`);
+}
+
+export async function loginToChatGpt(
+  config: AppConfig,
+  options: { timeoutMs?: number } = {},
+): Promise<BrowserLoginResult> {
+  if (!existsSync(config.chromeExecutablePath)) {
+    throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`);
+  }
+  const profileDir = join(dirname(config.storageStatePath), "login-profile");
+  mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  process.stdout.write(
+    "A normal Chrome window is open. Sign in to ChatGPT, confirm that the composer is visible, then quit this dedicated Chrome instance completely.\n",
+  );
+  const loginBrowser = spawn(config.chromeExecutablePath, [
+    `--user-data-dir=${profileDir}`,
+    "--new-window",
+    "--disable-background-mode",
+    "--no-first-run",
+    "--no-default-browser-check",
+    CHATGPT_CHAT_URL,
+  ], { env: process.env, stdio: "ignore" });
+  const loginExit = await new Promise<number>((resolveExit, rejectExit) => {
+    loginBrowser.once("error", rejectExit);
+    loginBrowser.once("exit", (code, signal) => {
+      if (signal) rejectExit(new Error(`Normal Chrome login window exited from signal ${signal}`));
+      else resolveExit(code ?? 1);
+    });
+  });
+  if (loginExit !== 0) throw new Error(`Normal Chrome login window exited with status ${loginExit}`);
+
+  const context = await chromium.launchPersistentContext(profileDir, {
+    executablePath: config.chromeExecutablePath,
+    headless: false,
+    ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
+    args: ["--no-first-run", "--no-default-browser-check"],
+  });
+  try {
+    const page = context.pages()[0] ?? await context.newPage();
+    await page.goto(CHATGPT_CHAT_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: 60_000,
+    });
+    const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" }).or(
+      page.locator('[data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"]'),
+    ).first();
+    try {
+      await composer.waitFor({ state: "visible", timeout: options.timeoutMs ?? 60_000 });
+    } catch {
+      throw new Error("The authenticated ChatGPT page did not produce a visible composer");
+    }
+    await assertAuthenticatedChatGptPage(page);
+    await assertPersistentChatPage(page);
+    const state = await context.storageState();
+
+    const inspected = await inspectStoredState(config, state);
+    atomicWriteFile(config.storageStatePath, `${JSON.stringify(state)}\n`);
+    writeVerificationMarker(config.storageStatePath, inspected);
+    return {
+      storageStatePath: config.storageStatePath,
+      accountSurfaceUrl: page.url(),
+      solAvailable: inspected.solAvailable,
+      proAvailable: inspected.proAvailable,
+    };
+  } finally {
+    await context.close();
+    if (browserLoginStateExists(config)) rmSync(profileDir, { recursive: true, force: true });
+  }
+}
+
+export function browserLoginStateExists(config: AppConfig): boolean {
+  if (!existsSync(config.storageStatePath)) return false;
+  const markerPath = loginVerificationMarkerPath(config.storageStatePath);
+  if (!existsSync(markerPath)) return false;
+  try {
+    const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Partial<LoginVerificationMarker>;
+    return marker.version === 1 && marker.authenticated === true && typeof marker.verifiedAt === "string";
+  } catch {
+    return false;
+  }
+}
+
+export async function checkBrowserEngine(config: AppConfig): Promise<void> {
+  if (!existsSync(config.chromeExecutablePath)) throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}`);
+  const browser = await chromium.launch({
+    executablePath: config.chromeExecutablePath,
+    headless: true,
+    args: ["--no-first-run", "--no-default-browser-check"],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.goto("about:blank");
+    if (await page.evaluate(() => document.readyState) !== "complete") throw new Error("Browser page did not reach complete state");
+  } finally {
+    await browser.close();
+  }
+}

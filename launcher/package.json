@@ -1,0 +1,116 @@
+{
+  "name": "star-moon",
+  "version": "5.0.2",
+  "private": true,
+  "license": "MIT",
+  "description": "Star Moon local desktop application, derived from Codex ChatGPT Web",
+  "homepage": "https://github.com/miuuyy/codex-chatgpt-web",
+  "desktopName": "star-moon.desktop",
+  "author": "miuuyy",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "bun run scripts/dev.cjs",
+    "audit": "bun audit",
+    "typecheck": "tsc --noEmit",
+    "build:renderer": "vite build",
+    "build": "bun run typecheck && bun run build:renderer",
+    "build:runtime": "bun run scripts/prepare-runtime.cjs",
+    "package": "bun run build && bun run build:runtime && bun run scripts/package.cjs",
+    "package:mac": "bun run build && bun run build:runtime && bun run scripts/package.cjs --mac",
+    "package:win": "bun run build && bun run build:runtime && bun run scripts/package.cjs --win",
+    "package:linux": "bun run build && bun run build:runtime && bun run scripts/package.cjs --linux",
+    "smoke:package": "bun run scripts/smoke-package.cjs",
+    "test": "bun test tests/*.test.cjs",
+    "test:duplex": "bun test tests/duplex-ui.test.ts tests/onboarding-art.test.tsx tests/moon-book.test.tsx tests/endless-night-journey.test.tsx",
+    "dev:preview": "vite --host 127.0.0.1 --port 4187 --strictPort",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "motion": "^12.42.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "41.10.7",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.9.3",
+    "vite": "^6.0.0"
+  },
+  "overrides": {
+    "@xmldom/xmldom": "0.8.15",
+    "fast-uri": "3.1.6"
+  },
+  "build": {
+    "appId": "dev.starmoon.launcher",
+    "productName": "Star Moon",
+    "artifactName": "star-moon-${version}-${os}-${arch}.${ext}",
+    "asar": true,
+    "asarUnpack": [
+      "assets/linux-appimage-runner.sh"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "assets/icon.png",
+      "assets/linux-appimage-runner.sh",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/runtime",
+        "to": "runtime"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "assets/icon.png",
+      "minimumSystemVersion": "13.0",
+      "hardenedRuntime": true,
+      "signIgnore": [
+        "[/\\\\]Contents[/\\\\]Resources[/\\\\]runtime[/\\\\]runtime[/\\\\]bun$"
+      ],
+      "target": ["dmg", "zip"]
+    },
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": ["nsis"]
+    },
+    "linux": {
+      "category": "Development",
+      "icon": "assets/icon.png",
+      "executableName": "star-moon",
+      "syncDesktopName": true,
+      "desktop": {
+        "entry": {
+          "Name": "Star Moon",
+          "Comment": "Star Moon local desktop application",
+          "StartupWMClass": "star-moon"
+        }
+      },
+      "target": ["AppImage", "deb", "rpm"]
+    },
+    "deb": {
+      "packageName": "star-moon",
+      "maintainer": "Star Moon local build <noreply@star-moon.invalid>",
+      "vendor": "Star Moon local build",
+      "priority": "optional"
+    },
+    "nsis": {
+      "guid": "f63f3b5a-1d82-4df4-851c-5469d2e743b6",
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "runAfterFinish": true
+    }
+  }
+}

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs><linearGradient id="night" x2="1" y2="1"><stop stop-color="#181d35"/><stop offset="1" stop-color="#403252"/></linearGradient><linearGradient id="moon" x2="1" y2="1"><stop stop-color="#fffbee"/><stop offset=".55" stop-color="#e4daf7"/><stop offset="1" stop-color="#baa0dd"/></linearGradient></defs>
+  <rect width="512" height="512" rx="116" fill="url(#night)"/>
+  <path d="M307 107c-77-21-153 35-163 110-13 94 59 166 144 166 63 0 114-35 139-84-91 35-173-13-188-81-10-49 17-90 68-111Z" fill="url(#moon)"/>
+  <ellipse cx="253" cy="259" rx="203" ry="117" transform="rotate(-34 253 259)" fill="none" stroke="#cdb57d" stroke-width="3" opacity=".85"/>
+  <circle cx="89" cy="355" r="5" fill="#ead29e"/>
+</svg>

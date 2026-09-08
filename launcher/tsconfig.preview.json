@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src", "tests/ui-preview.ts", "tests/preview-copy.ts", "tests/farewell-preview.ts"]
+}
